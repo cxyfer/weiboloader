@@ -1,6 +1,14 @@
+<div align="center">
+
 # weiboloader
 
-A command-line tool for downloading media (pictures & videos) from [Weibo](https://weibo.com), inspired by [instaloader](https://github.com/instaloader/instaloader).
+*A command-line tool for downloading media from [Weibo](https://weibo.com), inspired by [instaloader](https://github.com/instaloader/instaloader).*
+*Built as a rewrite of [weiboPicDownloader](https://github.com/cxyfer/weiboPicDownloader) (a fork of [nondanee/weiboPicDownloader](https://github.com/nondanee/weiboPicDownloader)).*
+
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square&logo=python)](https://www.python.org)
+[![License](https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square)](LICENSE)
+
+</div>
 
 ## Features
 
@@ -129,4 +137,4 @@ loader.download_target(UserTarget(identifier="1234567890", is_uid=True))
 
 ## License
 
-MIT
+GPLv3
