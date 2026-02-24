@@ -94,7 +94,7 @@ class CheckpointManager:
                 json.dump(data, f)
                 f.flush()
                 os.fsync(f.fileno())
-            os.rename(tmp, path)
+            os.replace(tmp, path)
         except Exception as e:
             logger.error("checkpoint save failed: %s", e)
             Path(tmp).unlink(missing_ok=True)
