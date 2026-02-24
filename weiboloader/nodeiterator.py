@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
+import sys
 import tempfile
 from collections import deque
 from collections.abc import Iterator
@@ -15,6 +15,8 @@ from .structures import CursorState, Post
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+_IS_WIN = sys.platform == "win32"
 
 logger = logging.getLogger(__name__)
 VERSION = "1"
@@ -36,12 +38,25 @@ class CheckpointManager:
         lock_path.touch(exist_ok=True)
         with open(lock_path, "w") as f:
             try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if _IS_WIN:
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 yield
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 raise RuntimeError(f"lock contention: {key}")
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                if _IS_WIN:
+                    import msvcrt
+                    try:
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(f, fcntl.LOCK_UN)
 
     def load(self, key: str) -> CursorState | None:
         path, _ = self._paths(key)
