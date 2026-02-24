@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import PurePosixPath
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from .exceptions import APISchemaError
 from .structures import MediaItem, Post, SuperTopic, User
@@ -80,7 +82,8 @@ def _extract_media(mblog: Mapping[str, Any]) -> list[MediaItem]:
     for i, pic in enumerate(mblog.get("pics", [])):
         url = pic.get("large", {}).get("url") or pic.get("url")
         if url:
-            items.append(MediaItem(media_type="picture", url=url, index=i, raw=pic))
+            hint = PurePosixPath(urlparse(url).path).stem or None
+            items.append(MediaItem(media_type="picture", url=url, index=i, filename_hint=hint, raw=pic))
 
     page = mblog.get("page_info")
     if page and page.get("type") == "video":
@@ -88,7 +91,8 @@ def _extract_media(mblog: Mapping[str, Any]) -> list[MediaItem]:
         url = info.get("stream_url_hd") or info.get("mp4_720p_mp4") or \
               info.get("mp4_hd_url") or info.get("stream_url")
         if url:
-            items.append(MediaItem(media_type="video", url=url, index=len(items), raw=page))
+            hint = PurePosixPath(urlparse(url).path).stem or None
+            items.append(MediaItem(media_type="video", url=url, index=len(items), filename_hint=hint, raw=page))
 
     return items
 

@@ -8,7 +8,7 @@ from .structures import MidTarget, SearchTarget, SuperTopicTarget, TargetSpec, U
 
 ILLEGAL = '\\/:*?"<>|'
 MAX_TEXT = 50
-DATE_FMT = "%Y%m%d_%H%M%S"
+DATE_FMT = "%Y-%m-%d"
 
 DEFAULT_PATTERNS: dict[str, str] = {
     "user": "./{nickname}/",
