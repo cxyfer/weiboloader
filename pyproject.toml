@@ -9,6 +9,7 @@ description = "A Weibo media downloader inspired by instaloader"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.28",
+    "rich>=13.0",
 ]
 
 [project.optional-dependencies]

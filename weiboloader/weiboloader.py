@@ -17,6 +17,7 @@ from .exceptions import CheckpointError, TargetError
 from .naming import build_directory, build_filename
 from .nodeiterator import CheckpointManager, NodeIterator
 from .structures import MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, TargetSpec, UserTarget
+from .ui import DownloadResult, EventKind, MediaOutcome, NullSink, ProgressSink, UIEvent
 
 logger = logging.getLogger(__name__)
 CST = timezone(timedelta(hours=8))
@@ -65,8 +66,10 @@ class WeiboLoader:
         no_resume: bool = False,
         checkpoint_dir: str | Path | None = None,
         output_dir: str | Path = ".",
+        progress: ProgressSink | None = None,
     ):
         self.context = context
+        self._sink: ProgressSink = progress or NullSink()
         self.dirname_pattern = dirname_pattern
         self.filename_pattern = filename_pattern
         self.no_videos = no_videos
@@ -91,6 +94,12 @@ class WeiboLoader:
         self._saved_stamps = self._serialize_stamps()
         self._active_iters: dict[str, NodeIterator] = {}
 
+    def _safe_emit(self, event: UIEvent) -> None:
+        try:
+            self._sink.emit(event)
+        except Exception:
+            logger.debug("sink.emit failed", exc_info=True)
+
     def download_targets(self, targets: Sequence[TargetSpec]) -> dict[str, bool]:
         results: dict[str, bool] = {}
         for target in targets:
@@ -107,10 +116,11 @@ class WeiboLoader:
         return results
 
     def download_target(self, target: TargetSpec) -> bool:
+        key = self._target_key(target)
         try:
             resolved = self._resolve_target(target)
         except Exception:
-            logger.exception("resolve failed: %s", self._target_key(target))
+            logger.exception("resolve failed: %s", key)
             return False
 
         ck_key = self._ck_key(resolved.key)
@@ -123,6 +133,11 @@ class WeiboLoader:
         processed = 0
         newest: datetime | None = None
         ok = True
+        downloaded = 0
+        skipped = 0
+        failed = 0
+
+        self._safe_emit(UIEvent(kind=EventKind.TARGET_START, target_key=resolved.key))
 
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as exe:
@@ -143,30 +158,68 @@ class WeiboLoader:
                     if self.post_metadata_txt:
                         self._write_txt(target_dir, post)
 
+                    media_total = len(jobs)
+                    media_done = 0
                     futures = [exe.submit(self._download, m.url, p) for m, p in jobs]
                     for f in as_completed(futures):
                         try:
-                            if f.result() is None:
-                                ok = False
+                            result = f.result()
                         except Exception:
+                            failed += 1
                             ok = False
+                            media_done += 1
+                            self._safe_emit(UIEvent(
+                                kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
+                                media_done=media_done, media_total=media_total,
+                            ))
+                            continue
+                        if result.outcome == MediaOutcome.DOWNLOADED:
+                            downloaded += 1
+                        elif result.outcome == MediaOutcome.SKIPPED:
+                            skipped += 1
+                        else:
+                            failed += 1
+                            ok = False
+                        media_done += 1
+                        self._safe_emit(UIEvent(
+                            kind=EventKind.MEDIA_DONE, outcome=result.outcome,
+                            media_done=media_done, media_total=media_total,
+                        ))
 
                     processed += 1
                     if newest is None or created > newest:
                         newest = created
                     self._save_ck(ck_key, iterator)
+                    self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
             if newest and (cutoff is None or newest > cutoff):
                 self._stamps[resolved.key] = newest
             self._clear_ck(ck_key)
             self._save_stamps()
+
+            self._safe_emit(UIEvent(
+                kind=EventKind.TARGET_DONE, target_key=resolved.key,
+                posts_processed=processed, downloaded=downloaded,
+                skipped=skipped, failed=failed, ok=ok,
+            ))
             return ok
 
         except KeyboardInterrupt:
+            self._safe_emit(UIEvent(kind=EventKind.INTERRUPTED, target_key=resolved.key))
+            self._safe_emit(UIEvent(
+                kind=EventKind.TARGET_DONE, target_key=resolved.key,
+                posts_processed=processed, downloaded=downloaded,
+                skipped=skipped, failed=failed, ok=False,
+            ))
             self._handle_interrupt(ck_key, iterator, newest, cutoff)
             raise
         except Exception:
             logger.exception("download failed: %s", resolved.key)
+            self._safe_emit(UIEvent(
+                kind=EventKind.TARGET_DONE, target_key=resolved.key,
+                posts_processed=processed, downloaded=downloaded,
+                skipped=skipped, failed=failed, ok=False,
+            ))
             self._handle_error(ck_key, iterator, newest, cutoff)
             return False
         finally:
@@ -195,9 +248,9 @@ class WeiboLoader:
             it.thaw(state)
         return it
 
-    def _download(self, url: str, dest: Path) -> Path | None:
+    def _download(self, url: str, dest: Path) -> DownloadResult:
         if dest.exists() and dest.stat().st_size > 0:
-            return dest
+            return DownloadResult(MediaOutcome.SKIPPED, dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_suffix(".part")
         resp = None
@@ -210,10 +263,10 @@ class WeiboLoader:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(part, dest)
-            return dest
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
         except Exception:
             logger.exception("download failed: %s", url)
-            return None
+            return DownloadResult(MediaOutcome.FAILED, dest)
         finally:
             if resp:
                 resp.close()
@@ -224,6 +277,7 @@ class WeiboLoader:
         self._save_stamps()
 
     def _resolve_target(self, target: TargetSpec) -> _ResolvedTarget:
+        self._safe_emit(UIEvent(kind=EventKind.STAGE, message=f"Resolving {self._target_key(target)}"))
         if isinstance(target, UserTarget):
             uid = target.identifier if target.is_uid else self.context.resolve_nickname_to_uid(target.identifier)
             nickname = uid

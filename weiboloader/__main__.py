@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 from urllib.parse import parse_qs, urlparse
@@ -9,6 +10,7 @@ from .context import WeiboLoaderContext
 from .exceptions import InitError, map_exception_to_exit_code
 from .ratecontrol import SlidingWindowRateController
 from .structures import MidTarget, SearchTarget, SuperTopicTarget, TargetSpec, UserTarget
+from .ui import EventKind, NullSink, RichSink, UIEvent
 from .weiboloader import WeiboLoader
 
 _DETAIL_MID_RE = re.compile(r"/detail/([^/?#]+)")
@@ -104,14 +106,35 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     loader: WeiboLoader | None = None
+    sink: NullSink | RichSink | None = None
 
     try:
         args = parse_args(argv)
+
+        use_rich = sys.stderr.isatty()
+        if use_rich:
+            from rich.console import Console
+            from rich.logging import RichHandler
+
+            console = Console(stderr=True)
+            sink = RichSink(console)
+            logging.basicConfig(
+                handlers=[RichHandler(console=console, show_path=False)],
+                level=logging.WARNING,
+                format="%(message)s",
+            )
+        else:
+            sink = NullSink()
+
+        captcha_pause = getattr(sink, "pause", None)
+        captcha_resume = getattr(sink, "resume", None)
 
         context = WeiboLoaderContext(
             rate_controller=SlidingWindowRateController(request_interval=args.request_interval),
             captcha_mode=args.captcha_mode,
             session_path=args.sessionfile,
+            on_captcha_pause=captcha_pause,
+            on_captcha_resume=captcha_resume,
         )
 
         has_auth = context.load_session(args.sessionfile)
@@ -125,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             context.set_cookies_from_file(args.cookie_file)
             has_auth = True
         if args.visitor_cookies:
+            sink.emit(UIEvent(kind=EventKind.STAGE, message="Fetching visitor cookies"))
             context.fetch_visitor_cookies()
             has_auth = True
 
@@ -147,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             metadata_json=args.metadata_json,
             post_metadata_txt=args.post_metadata_txt,
             no_resume=args.no_resume,
+            progress=sink,
         )
 
         raw_targets = args.targets if args.targets else [""]
@@ -166,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if code == 0 else 2
     except BaseException as exc:
         return map_exception_to_exit_code(exc)
+    finally:
+        if sink is not None:
+            sink.close()
 
 
 if __name__ == "__main__":

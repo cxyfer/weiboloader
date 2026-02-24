@@ -4,7 +4,7 @@ import copy
 import json
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import requests
@@ -48,6 +48,8 @@ class WeiboLoaderContext:
         captcha_timeout: int = TIMEOUT_DEFAULT,
         request_timeout: int = 20,
         session_path: str | Path | None = None,
+        on_captcha_pause: Callable[[], None] | None = None,
+        on_captcha_resume: Callable[[], None] | None = None,
     ):
         self.session = session or requests.Session()
         for k, v in self.HEADERS.items():
@@ -58,6 +60,8 @@ class WeiboLoaderContext:
         self.captcha_timeout = captcha_timeout
         self.req_timeout = request_timeout
         self._session_path = self._resolve_path(session_path)
+        self._on_captcha_pause = on_captcha_pause
+        self._on_captcha_resume = on_captcha_resume
 
         self._captcha_handlers = {
             "manual": ManualCaptchaHandler(),
@@ -301,10 +305,21 @@ class WeiboLoaderContext:
             handler = self._captcha_handlers["browser"] if is_playwright_available() else self._captcha_handlers["manual"]
         if not handler:
             raise AuthError(f"captcha mode not available: {self.captcha_mode}")
+        if self._on_captcha_pause:
+            try:
+                self._on_captcha_pause()
+            except Exception:
+                pass
         try:
             return handler.solve(url, self.session, self.captcha_timeout)
         except Exception:
             return False
+        finally:
+            if self._on_captcha_resume:
+                try:
+                    self._on_captcha_resume()
+                except Exception:
+                    pass
 
     def _get_json(self, url: str, **kwargs) -> dict[str, Any]:
         resp = self.request("GET", url, **kwargs)

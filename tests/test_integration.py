@@ -12,6 +12,7 @@ import responses
 
 from weiboloader.context import WeiboLoaderContext
 from weiboloader.structures import Post, User, UserTarget, SuperTopicTarget, MidTarget
+from weiboloader.ui import DownloadResult, MediaOutcome
 from weiboloader.weiboloader import WeiboLoader
 
 if TYPE_CHECKING:
@@ -145,7 +146,7 @@ class TestFullLifecycle:
 
         loader = WeiboLoader(mock_context, output_dir=tmp_path)
 
-        with patch.object(loader, '_download', return_value=tmp_path / "test.jpg"):
+        with patch.object(loader, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
             result = loader.download_target(
                 UserTarget(identifier="123456", is_uid=True)
             )
@@ -190,7 +191,7 @@ class TestFullLifecycle:
 
         loader = WeiboLoader(mock_context, output_dir=tmp_path)
 
-        with patch.object(loader, '_download', return_value=tmp_path / "test.jpg"):
+        with patch.object(loader, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
             result = loader.download_target(
                 SuperTopicTarget(identifier="topic", is_containerid=False)
             )
@@ -205,7 +206,7 @@ class TestFullLifecycle:
 
         loader = WeiboLoader(mock_context, output_dir=tmp_path)
 
-        with patch.object(loader, '_download', return_value=tmp_path / "test.jpg"):
+        with patch.object(loader, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
             result = loader.download_target(
                 MidTarget(mid="abc123")
             )
@@ -238,7 +239,7 @@ class TestResumeOnFailure:
             processed_count[0] += 1
             if processed_count[0] >= 2:
                 raise KeyboardInterrupt("Simulated crash")
-            return tmp_path / "test.jpg"
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
 
         with patch.object(loader, '_download', side_effect=count_downloads):
             try:
@@ -300,7 +301,7 @@ class TestFilterVerification:
         media_types_captured = []
         def capture_media_type(media_item, *args, **kwargs):
             media_types_captured.append(media_item.media_type)
-            return tmp_path / "test.file"
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.file")
 
         with patch.object(loader, '_download', side_effect=capture_media_type):
             loader.download_target(
@@ -321,7 +322,7 @@ class TestFilterVerification:
         media_types_captured = []
         def capture_media_type(media_item, *args, **kwargs):
             media_types_captured.append(media_item.media_type)
-            return tmp_path / "test.file"
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.file")
 
         with patch.object(loader, '_download', side_effect=capture_media_type):
             loader.download_target(
@@ -346,7 +347,7 @@ class TestIncrementalUpdate:
         # First run with current timestamp
         loader1 = WeiboLoader(mock_context, output_dir=tmp_path, latest_stamps=stamps_path)
 
-        with patch.object(loader1, '_download', return_value=tmp_path / "test.jpg"):
+        with patch.object(loader1, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
             loader1.download_target(
                 UserTarget(identifier="123456", is_uid=True)
             )
@@ -358,7 +359,7 @@ class TestIncrementalUpdate:
         processed_in_second_run = []
         def track_processed(post, *args, **kwargs):
             processed_in_second_run.append(post.mid)
-            return tmp_path / "test.jpg"
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
 
         loader2 = WeiboLoader(mock_context, output_dir=tmp_path, latest_stamps=stamps_path)
 

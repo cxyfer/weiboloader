@@ -11,6 +11,7 @@ from hypothesis import given, settings, strategies as st
 
 from weiboloader.context import WeiboLoaderContext
 from weiboloader.structures import MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, UserTarget
+from weiboloader.ui import DownloadResult, MediaOutcome
 from weiboloader.weiboloader import WeiboLoader
 
 
@@ -89,7 +90,7 @@ class TestDownloadMedia:
         dest.write_text("existing content")
 
         result = loader._download("http://example.com/img.jpg", dest)
-        assert result == dest
+        assert result == DownloadResult(MediaOutcome.SKIPPED, dest)
 
     def test_download_when_empty(self, tmp_path: Path):
         """PBT: size==0 -> download."""
@@ -107,6 +108,7 @@ class TestDownloadMedia:
             result = loader._download("http://example.com/img.jpg", dest)
 
         assert result is not None
+        assert result.outcome == MediaOutcome.DOWNLOADED
         assert dest.read_bytes() == b"new data"
 
     def test_part_file_rename(self, tmp_path: Path):
@@ -122,7 +124,7 @@ class TestDownloadMedia:
 
             result = loader._download("http://example.com/img.jpg", dest)
 
-        assert result == dest
+        assert result == DownloadResult(MediaOutcome.DOWNLOADED, dest)
         assert dest.exists()
         assert not (tmp_path / "test.jpg.part").exists()
 
@@ -167,7 +169,7 @@ class TestCountLimit:
         ctx._posts["u:test:p:1"] = (posts[:5], "c2")
         ctx._posts["u:test:p:2"] = (posts[5:], None)
 
-        with patch.object(loader, "_download", return_value=tmp_path / "test.jpg"):
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
             with patch.object(loader, "_media_jobs", return_value=[]):
                 loader.download_target(UserTarget(identifier="test", is_uid=True))
 
