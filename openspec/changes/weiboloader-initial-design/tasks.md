@@ -260,14 +260,14 @@
 
 ## Verification Checklist
 
-- [ ] `weiboloader <uid>` downloads user media to `./{nickname}/`
-- [ ] `weiboloader "#超話名"` downloads supertopic media
-- [ ] `weiboloader -mid <mid>` downloads single post
-- [ ] `weiboloader ":search keyword"` downloads search results
-- [ ] `--load-cookies chrome` extracts cookies
-- [ ] Rate controller prevents 403/418 on extended runs
-- [ ] CAPTCHA flow works (or falls back gracefully)
-- [ ] Resume from checkpoint works correctly
-- [ ] `--fast-update` stops on existing files
-- [ ] `--latest-stamps` incremental update works
-- [ ] All 20 PBT properties pass
+- [x] `weiboloader <uid>` downloads user media to `./{nickname}/`
+- [x] `weiboloader "#超話名"` downloads supertopic media
+- [x] `weiboloader -mid <mid>` downloads single post
+- [x] `weiboloader ":search keyword"` downloads search results
+- [x] `--load-cookies chrome` extracts cookies
+- [x] Rate controller prevents 403/418 on extended runs
+- [x] CAPTCHA flow works (or falls back gracefully)
+- [x] Resume from checkpoint works correctly
+- [x] `--fast-update` stops on existing files
+- [x] `--latest-stamps` incremental update works
+- [x] All 20 PBT properties pass

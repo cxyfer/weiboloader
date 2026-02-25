@@ -213,13 +213,43 @@ class TestFullLifecycle:
 
         assert result is True
 
+    @responses.activate
+    def test_download_search_results(self, tmp_path: Path, mock_context: WeiboLoaderContext):
+        """Test: weiboloader ':search keyword' downloads search results"""
+        from weiboloader.structures import SearchTarget
+        keyword = "testquery"
+
+        responses.add(
+            responses.GET,
+            "https://m.weibo.cn/api/container/getIndex",
+            json={
+                "data": {
+                    "cards": [
+                        {"mblog": {"mid": "s1", "text": "Search result 1", "created_at": "Mon Jan 01 00:00:00 +0800 2024"}}
+                    ],
+                    "cardlistInfo": {}
+                }
+            },
+            match=[responses.matchers.query_param_matcher({
+                "containerid": f"100103type=1&q={keyword}",
+                "page": "1"
+            })]
+        )
+
+        loader = WeiboLoader(mock_context, output_dir=tmp_path)
+
+        with patch.object(loader, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            result = loader.download_target(SearchTarget(keyword=keyword))
+
+        assert result is True
+
 
 class TestResumeOnFailure:
     """Resume-on-failure integration tests."""
 
     @responses.activate
     def test_checkpoint_resume(self, tmp_path: Path, mock_api: MockWeiboAPI, mock_context: WeiboLoaderContext):
-        """Test: crash mid-download -> second run skips completed files via checkpoint"""
+        """Test: crash mid-download -> second run skips completed posts via checkpoint"""
         mock_api.setup_user_info("123456", "TestUser")
         mock_api.add_user_posts(3, "123456")
         mock_api.register(responses, uid="123456")
@@ -227,31 +257,39 @@ class TestResumeOnFailure:
         checkpoint_dir = tmp_path / "checkpoints"
         checkpoint_dir.mkdir()
 
-        loader = WeiboLoader(
-            mock_context,
-            output_dir=tmp_path,
-            checkpoint_dir=checkpoint_dir
-        )
-
-        # Simulate first run that processes 2 posts then "crashes"
-        processed_count = [0]
-        def count_downloads(*args, **kwargs):
-            processed_count[0] += 1
-            if processed_count[0] >= 2:
+        # First run: crash on 2nd download attempt
+        download_count = [0]
+        def crash_on_second(url, dest):
+            download_count[0] += 1
+            if download_count[0] >= 2:
                 raise KeyboardInterrupt("Simulated crash")
             return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
 
-        with patch.object(loader, '_download', side_effect=count_downloads):
+        loader1 = WeiboLoader(mock_context, output_dir=tmp_path, checkpoint_dir=checkpoint_dir)
+        with patch.object(loader1, '_download', side_effect=crash_on_second):
             try:
-                loader.download_target(
-                    UserTarget(identifier="123456", is_uid=True)
-                )
+                loader1.download_target(UserTarget(identifier="123456", is_uid=True))
             except KeyboardInterrupt:
                 pass
 
-        # Checkpoint should exist
+        # Checkpoint should exist after interrupt
         checkpoint_files = list(checkpoint_dir.glob("*.json"))
         assert len(checkpoint_files) > 0, "Checkpoint should be saved on interrupt"
+
+        # Second run: loads checkpoint with seen_mids, processes only remaining posts
+        second_run_count = [0]
+        def count_second(url, dest):
+            second_run_count[0] += 1
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
+
+        loader2 = WeiboLoader(mock_context, output_dir=tmp_path, checkpoint_dir=checkpoint_dir)
+        with patch.object(loader2, '_download', side_effect=count_second):
+            loader2.download_target(UserTarget(identifier="123456", is_uid=True))
+
+        # Second run should need fewer (or zero) downloads than first run crashed on
+        assert second_run_count[0] < download_count[0], (
+            f"Second run ({second_run_count[0]}) should need fewer downloads than first run attempted ({download_count[0]})"
+        )
 
 
 class TestRateLimitRecovery:
@@ -344,32 +382,30 @@ class TestIncrementalUpdate:
 
         stamps_path = tmp_path / "stamps.json"
 
-        # First run with current timestamp
+        # First run: download all posts
+        run1_downloads = [0]
+        def count_run1(url, dest):
+            run1_downloads[0] += 1
+            return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
+
         loader1 = WeiboLoader(mock_context, output_dir=tmp_path, latest_stamps=stamps_path)
+        with patch.object(loader1, '_download', side_effect=count_run1):
+            loader1.download_target(UserTarget(identifier="123456", is_uid=True))
 
-        with patch.object(loader1, '_download', return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
-            loader1.download_target(
-                UserTarget(identifier="123456", is_uid=True)
-            )
-
-        # Verify stamps were saved
         assert stamps_path.exists()
+        assert run1_downloads[0] > 0, "First run should download at least one file"
 
-        # Second run should skip all posts
-        processed_in_second_run = []
-        def track_processed(post, *args, **kwargs):
-            processed_in_second_run.append(post.mid)
+        # Second run: all posts have same created_at as stamp → all filtered by cutoff
+        run2_downloads = [0]
+        def count_run2(url, dest):
+            run2_downloads[0] += 1
             return DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")
 
         loader2 = WeiboLoader(mock_context, output_dir=tmp_path, latest_stamps=stamps_path)
+        with patch.object(loader2, '_download', side_effect=count_run2):
+            loader2.download_target(UserTarget(identifier="123456", is_uid=True))
 
-        with patch.object(loader2, '_download', side_effect=track_processed):
-            loader2.download_target(
-                UserTarget(identifier="123456", is_uid=True)
-            )
-
-        # All posts should be skipped as they're older than saved stamp
-        # Note: This depends on actual timestamp logic in weiboloader
+        assert run2_downloads[0] == 0, "Second run should skip all posts (created_at <= latest stamp cutoff)"
 
 
 class TestCaptchaFallback:

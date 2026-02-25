@@ -212,16 +212,27 @@ class TestFastUpdate:
         ctx = MockContext()
         loader = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True)
 
-        post = make_post("m1", media_items=[make_media("http://i.jpg")])
-        ctx._posts["u:test:p:1"] = ([post], None)
+        posts = [make_post(f"m{i}", media_items=[make_media(f"http://i{i}.jpg")]) for i in range(3)]
+        ctx._posts["u:test:p:1"] = (posts, None)
 
         target_dir = tmp_path / "test"
         target_dir.mkdir()
-        (target_dir / "existing.jpg").write_text("exists")
+        existing = target_dir / "existing.jpg"
+        existing.write_text("exists")
 
-        with patch.object(loader, "_media_path", return_value=target_dir / "existing.jpg"):
+        download_calls = []
+        original_download = loader._download
+        def tracking_download(url, dest):
+            download_calls.append(url)
+            return DownloadResult(MediaOutcome.SKIPPED, dest)
+
+        with patch.object(loader, "_media_path", return_value=existing):
             with patch.object(loader, "_save_ck"):
-                result = loader.download_target(UserTarget(identifier="test", is_uid=True))
+                with patch.object(loader, "_download", side_effect=tracking_download):
+                    loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        # fast_update should stop when existing file found; no downloads attempted
+        assert len(download_calls) == 0, "fast_update should stop before downloading when existing file found"
 
 
 class TestMetadataExport:
@@ -477,3 +488,68 @@ class TestDownloadLoopEnriched:
 
         media_events = [e for e in sink.events if e.kind == EventKind.MEDIA_DONE]
         assert len(media_events) == 4
+
+
+@given(st.integers(min_value=1, max_value=255))
+@settings(max_examples=20)
+def test_skip_existing_nonempty_file(size: int):
+    """PBT: exists && size>0 → skip (no request made)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        dest = Path(d) / "media.jpg"
+        dest.write_bytes(bytes(size))
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=Path(d))
+        request_called = [False]
+        def track_request(*a, **kw):
+            request_called[0] = True
+            return MagicMock()
+        with patch.object(ctx, "request", side_effect=track_request):
+            result = loader._download("http://x.com/a.jpg", dest)
+        assert result.outcome == MediaOutcome.SKIPPED
+        assert not request_called[0], "No HTTP request should be made for existing non-empty file"
+
+
+@given(
+    st.booleans(),
+    st.booleans(),
+    st.lists(st.sampled_from(["picture", "video"]), min_size=1, max_size=5),
+)
+@settings(max_examples=20)
+def test_media_type_filter_pbt(no_videos: bool, no_pictures: bool, media_types: list):
+    """PBT: filter flags produce zero forbidden types in jobs."""
+    from weiboloader.structures import MediaItem, Post
+    ctx = MockContext()
+    loader = WeiboLoader(ctx, output_dir=Path("/tmp"), no_videos=no_videos, no_pictures=no_pictures)
+    items = [MediaItem(url=f"http://x/{i}", media_type=t, index=i, filename_hint=None, raw={}) for i, t in enumerate(media_types)]
+    post = make_post("m1", media_items=items)
+    jobs = loader._media_jobs(Path("/tmp"), post)
+    types_in_jobs = [m.media_type for m, _ in jobs]
+    if no_videos:
+        assert "video" not in types_in_jobs
+    if no_pictures:
+        assert "picture" not in types_in_jobs
+
+
+@given(
+    st.text(min_size=1, max_size=20, alphabet=st.characters(whitelist_categories=("Lu", "Ll", "Nd"))),
+    st.datetimes(
+        min_value=__import__('datetime').datetime(2020, 1, 1),
+        max_value=__import__('datetime').datetime(2030, 1, 1),
+        timezones=__import__('hypothesis.strategies', fromlist=['just']).just(__import__('datetime').timezone(__import__('datetime').timedelta(hours=8))),
+    ),
+)
+@settings(max_examples=20)
+def test_stamps_roundtrip_pbt(uid: str, ts):
+    """PBT: Load(Save(stamps)) == stamps."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        stamps_path = Path(d) / "stamps.json"
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=Path(d), latest_stamps=stamps_path)
+        key = f"u:{uid}"
+        loader._stamps[key] = ts
+        loader._save_stamps()
+        loader2 = WeiboLoader(ctx, output_dir=Path(d), latest_stamps=stamps_path)
+        assert key in loader2._stamps, f"Key {key} missing after roundtrip"
+        assert loader2._stamps[key].isoformat() == ts.isoformat()
