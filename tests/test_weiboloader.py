@@ -398,6 +398,55 @@ class TestDownloadTimeout:
 
         assert result.outcome.value == "failed"
 
+    def test_deadline_timeout_returns_failed_and_no_part(self, tmp_path: Path):
+        """P1+P2: TimeoutError from deadline fires -> FAILED, .part absent."""
+        import time
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "slow.jpg"
+
+        def slow_chunks():
+            yield b"first chunk"
+            time.sleep(0.01)
+            yield b"second chunk"
+
+        mock_resp = MagicMock()
+        mock_resp.iter_content.return_value = slow_chunks()
+        with patch.object(ctx, "request", return_value=mock_resp):
+            with patch("weiboloader.weiboloader._MEDIA_DOWNLOAD_TIMEOUT", -1):
+                result = loader._download("http://example.com/slow.jpg", dest)
+
+        assert result.outcome == MediaOutcome.FAILED
+        assert not dest.with_suffix(".part").exists()
+
+    def test_wall_clock_bounded(self, tmp_path: Path):
+        """P1: _download returns within timeout + epsilon even on infinite stream."""
+        import time
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "infinite.jpg"
+
+        def infinite_chunks():
+            while True:
+                yield b"x" * 1024
+
+        mock_resp = MagicMock()
+        mock_resp.iter_content.return_value = infinite_chunks()
+        with patch.object(ctx, "request", return_value=mock_resp):
+            with patch("weiboloader.weiboloader._MEDIA_DOWNLOAD_TIMEOUT", 0):
+                start = time.monotonic()
+                result = loader._download("http://example.com/infinite.jpg", dest)
+                elapsed = time.monotonic() - start
+
+        assert result.outcome == MediaOutcome.FAILED
+        assert elapsed < 5  # well within any reasonable epsilon
+
+    def test_get_socket_returns_none_on_mock(self):
+        """_get_socket returns None for mock responses (no real socket)."""
+        from weiboloader.weiboloader import _get_socket
+        mock_resp = MagicMock(spec=[])
+        assert _get_socket(mock_resp) is None
+
 
 class TestDownloadLoopEnriched:
     def _make_post(self, mid, media_urls):

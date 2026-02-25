@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from .ui import DownloadResult, EventKind, MediaOutcome, NullSink, ProgressSink,
 logger = logging.getLogger(__name__)
 CST = timezone(timedelta(hours=8))
 _STREAM_READ_TIMEOUT = 60
+_MEDIA_DOWNLOAD_TIMEOUT = 60
 _PER_MEDIA_TIMEOUT = 30
 
 
@@ -48,6 +50,17 @@ class _PostIterator(NodeIterator):
             return posts, None, False
         posts, cursor = self._fetch(self._page)
         return posts, cursor, bool(posts and cursor)
+
+
+def _get_socket(resp):
+    try:
+        return resp.raw.fp.fp.raw._sock
+    except AttributeError:
+        pass
+    try:
+        return resp.raw._original_response.fp.raw._sock
+    except AttributeError:
+        return None
 
 
 class WeiboLoader:
@@ -280,13 +293,25 @@ class WeiboLoader:
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = dest.with_suffix(".part")
         resp = None
+        deadline = time.monotonic() + _MEDIA_DOWNLOAD_TIMEOUT
         try:
             resp = self.context.request(
                 "GET", url, bucket="media", allow_captcha=False, stream=True, retries=2,
                 timeout=(self.context.req_timeout, _STREAM_READ_TIMEOUT),
             )
+            sock = _get_socket(resp)
+            if sock is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("download timeout")
+                sock.settimeout(remaining)
             with open(part, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("download timeout")
+                    if sock is not None:
+                        sock.settimeout(remaining)
                     if chunk:
                         f.write(chunk)
                 f.flush()

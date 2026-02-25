@@ -126,3 +126,51 @@ When `as_completed` global timeout occurs, the checkpoint SHALL NOT be advanced 
 ### PC.3: Stat consistency at target level
 - **Property**: `∀ TARGET_DONE event, downloaded + skipped + failed == Σ(media_total across all POSTs)`
 - **Falsification**: Run full target download with mixed outcomes, verify TARGET_DONE aggregates
+
+---
+
+## ADDED Requirements (fix-download-hang-timeout-retry)
+
+### Requirement: Per-file wall-clock timeout
+
+`_download()` MUST return within `_MEDIA_DOWNLOAD_TIMEOUT = 60` seconds of being invoked,
+regardless of CDN throughput. Implemented via `_get_socket(resp)` + `sock.settimeout(remaining)`
+deadline loop; deadline is set before `context.request()` call.
+
+#### Scenario: Stalled CDN
+- **GIVEN** a streaming response that delivers < 1 byte/second of body data
+- **WHEN** `_download()` is called
+- **THEN** it returns within 60 + epsilon seconds with `MediaOutcome.FAILED`
+
+#### Scenario: Trickling CDN (bypasses per-chunk timeout)
+- **GIVEN** a streaming response that sends 1 byte every 30 seconds (within `_STREAM_READ_TIMEOUT`)
+- **WHEN** `_download()` is called
+- **THEN** it returns within 60 + epsilon seconds with `MediaOutcome.FAILED`
+
+#### Constraint: Mechanism
+- `_MEDIA_DOWNLOAD_TIMEOUT = 60` constant in `weiboloader.py`
+- `_get_socket(resp)` extracts socket via `resp.raw.fp.fp.raw._sock`; returns `None` if unavailable
+- `sock.settimeout(remaining)` called before first chunk read and after each yielded chunk
+- `TimeoutError` raised when `remaining <= 0`; caught by existing `except Exception`
+
+### Requirement: No .part file left behind on timeout
+
+If the per-file timeout fires, the `.part` file MUST be removed. Enforced by existing
+`except Exception: part.unlink(missing_ok=True)` — unchanged.
+
+---
+
+## ADDED PBT Properties (fix-download-hang-timeout-retry)
+
+### P-ft.1: Bounded execution time
+- **Property**: `wall_clock(_download end) - wall_clock(_download start) ≤ _MEDIA_DOWNLOAD_TIMEOUT + epsilon`
+- **Boundary**: `epsilon = 5s`
+- **Falsification**: Mock server stalls indefinitely; measure wall clock
+
+### P-ft.2: No partial file leakage on timeout
+- **Property**: After `_download()` returns `FAILED`, `dest.with_suffix(".part").exists() == False`
+- **Falsification**: Interrupt mock response at random byte offset; check filesystem
+
+### P-ft.3: Thread isolation
+- **Property**: `sock.settimeout()` in one thread does not affect socket in another thread
+- **Falsification**: Two concurrent `_download()` calls; verify independent timeout behavior
