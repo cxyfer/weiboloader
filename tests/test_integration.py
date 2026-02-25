@@ -446,3 +446,124 @@ class TestCookieLoading:
         ctx.set_cookies_from_file(cookie_file)
 
         assert ctx.session.cookies.get("SUB", domain=".weibo.cn") == "file_test_value"
+
+
+class TestEnrichedEvents:
+    """Integration tests for enriched MEDIA_DONE events (progress-display-and-download-reliability)."""
+
+    def _make_ctx(self, tmp_path):
+        class SimpleCtx:
+            def __init__(self):
+                self.session = MagicMock()
+                self._posts = {}
+                self.req_timeout = 20
+
+            def get_user_info(self, uid):
+                m = MagicMock()
+                m.nickname = f"User_{uid}"
+                return m
+
+            def resolve_nickname_to_uid(self, n):
+                return n
+
+            def get_user_posts(self, uid, page):
+                return self._posts.get(f"u:{uid}:p:{page}", ([], None))
+
+            def request(self, *a, **kw):
+                return MagicMock()
+
+        return SimpleCtx()
+
+    def _make_post(self, mid, media_urls):
+        from weiboloader.structures import MediaItem, Post
+        items = [MediaItem(url=u, media_type="picture", index=i, filename_hint=f"img{i}.jpg") for i, u in enumerate(media_urls)]
+        return Post(mid=mid, bid=None, text=f"Post {mid}", created_at=datetime.now(CST), user=None, media_items=items, raw={"mid": mid})
+
+    def test_all_media_done_events_have_post_index_and_filename(self, tmp_path: Path):
+        from weiboloader.ui import EventKind, UIEvent
+
+        class CollectorSink:
+            def __init__(self):
+                self.events = []
+            def emit(self, e):
+                self.events.append(e)
+            def close(self):
+                pass
+
+        ctx = self._make_ctx(tmp_path)
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [
+            self._make_post("p1", ["http://example.com/a.jpg", "http://example.com/b.jpg"]),
+            self._make_post("p2", ["http://example.com/c.jpg"]),
+        ]
+        ctx._posts["u:u1:p:1"] = (posts, None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "x.jpg")):
+            loader.download_target(UserTarget(identifier="u1", is_uid=True))
+
+        media_events = [e for e in sink.events if e.kind == EventKind.MEDIA_DONE]
+        assert len(media_events) == 3
+        for e in media_events:
+            assert e.post_index is not None
+            assert e.filename is not None
+
+    def test_event_sequence_order(self, tmp_path: Path):
+        from weiboloader.ui import EventKind
+
+        class CollectorSink:
+            def __init__(self):
+                self.events = []
+            def emit(self, e):
+                self.events.append(e)
+            def close(self):
+                pass
+
+        ctx = self._make_ctx(tmp_path)
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [self._make_post("p1", ["http://example.com/a.jpg"])]
+        ctx._posts["u:u2:p:1"] = (posts, None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "x.jpg")):
+            loader.download_target(UserTarget(identifier="u2", is_uid=True))
+
+        kinds = [e.kind for e in sink.events]
+        assert EventKind.TARGET_START in kinds
+        assert EventKind.TARGET_DONE in kinds
+        assert kinds.index(EventKind.TARGET_START) < kinds.index(EventKind.TARGET_DONE)
+
+    def test_stat_consistency_at_target_level(self, tmp_path: Path):
+        from weiboloader.ui import EventKind
+
+        class CollectorSink:
+            def __init__(self):
+                self.events = []
+            def emit(self, e):
+                self.events.append(e)
+            def close(self):
+                pass
+
+        ctx = self._make_ctx(tmp_path)
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [self._make_post("p1", ["http://a.com/1.jpg", "http://a.com/2.jpg", "http://a.com/3.jpg"])]
+        ctx._posts["u:u3:p:1"] = (posts, None)
+
+        calls = [0]
+        def varying_download(url, dest):
+            calls[0] += 1
+            if calls[0] == 1:
+                return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+            elif calls[0] == 2:
+                return DownloadResult(MediaOutcome.SKIPPED, dest)
+            return DownloadResult(MediaOutcome.FAILED, dest)
+
+        with patch.object(loader, "_download", side_effect=varying_download):
+            loader.download_target(UserTarget(identifier="u3", is_uid=True))
+
+        done = [e for e in sink.events if e.kind == EventKind.TARGET_DONE][0]
+        assert done.downloaded + done.skipped + done.failed == 3

@@ -43,6 +43,7 @@ def make_media(url: str, media_type: str = "picture", index: int = 0) -> MediaIt
 class MockContext:
     def __init__(self):
         self.session = MagicMock()
+        self.req_timeout = 20
         self._posts: dict[str, list[Post]] = {}
         self._uids: dict[str, str] = {}
 
@@ -331,3 +332,148 @@ def test_count_property(count):
     ctx = MockContext()
     loader = WeiboLoader(ctx, output_dir=Path("/tmp"), count=count)
     assert loader.count == max(0, count)
+
+
+class TestDownloadTimeout:
+    def test_timeout_tuple_passed(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "new.jpg"
+
+        mock_resp = MagicMock()
+        mock_resp.iter_content.return_value = [b"data"]
+        with patch.object(ctx, "request", return_value=mock_resp) as mock_req:
+            loader._download("http://example.com/img.jpg", dest)
+
+        call_kwargs = mock_req.call_args[1]
+        timeout = call_kwargs.get("timeout")
+        assert isinstance(timeout, tuple) and len(timeout) == 2
+        assert timeout[1] == 60
+
+    def test_part_cleaned_on_read_timeout(self, tmp_path: Path):
+        from requests.exceptions import ReadTimeout
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "fail.jpg"
+
+        mock_resp = MagicMock()
+        mock_resp.iter_content.side_effect = ReadTimeout("timeout")
+        with patch.object(ctx, "request", return_value=mock_resp):
+            result = loader._download("http://example.com/img.jpg", dest)
+
+        assert result.outcome.value == "failed"
+        assert not (tmp_path / "fail.jpg.part").exists()
+
+    def test_part_cleaned_on_generic_exception(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "fail2.jpg"
+
+        mock_resp = MagicMock()
+        mock_resp.iter_content.side_effect = OSError("disk full")
+        with patch.object(ctx, "request", return_value=mock_resp):
+            result = loader._download("http://example.com/img.jpg", dest)
+
+        assert result.outcome.value == "failed"
+        assert not (tmp_path / "fail2.jpg.part").exists()
+
+    def test_part_missing_before_exception_is_silent(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "fail3.jpg"
+
+        with patch.object(ctx, "request", side_effect=ConnectionError("refused")):
+            result = loader._download("http://example.com/img.jpg", dest)
+
+        assert result.outcome.value == "failed"
+
+
+class TestDownloadLoopEnriched:
+    def _make_post(self, mid, media_urls):
+        items = [MediaItem(url=u, media_type="picture", index=i, filename_hint=f"img{i}.jpg") for i, u in enumerate(media_urls)]
+        return make_post(mid, media_items=items)
+
+    def test_events_carry_post_index_and_filename(self, tmp_path: Path):
+        from weiboloader.ui import EventKind, UIEvent
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [self._make_post("p1", ["http://example.com/a.jpg"])]
+        ctx._posts["u:111:p:1"] = (posts, None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "a.jpg")):
+            loader.download_target(UserTarget(identifier="111", is_uid=True))
+
+        media_events = [e for e in sink.events if e.kind == EventKind.MEDIA_DONE]
+        assert all(e.post_index is not None for e in media_events)
+        assert all(e.filename is not None for e in media_events)
+
+    def test_checkpoint_not_saved_on_timeout(self, tmp_path: Path):
+        from concurrent.futures import Future
+        from weiboloader.ui import EventKind
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [self._make_post("p1", ["http://example.com/a.jpg", "http://example.com/b.jpg"])]
+        ctx._posts["u:222:p:1"] = (posts, None)
+
+        import concurrent.futures
+
+        original_as_completed = concurrent.futures.as_completed
+
+        call_count = [0]
+        def patched_as_completed(fs, timeout=None):
+            call_count[0] += 1
+            if call_count[0] == 1 and timeout is not None:
+                raise concurrent.futures.TimeoutError()
+            return original_as_completed(fs, timeout=timeout)
+
+        ck_saved = []
+        original_save_ck = loader._save_ck
+        loader._save_ck = lambda key, it: ck_saved.append(key)
+
+        with patch("weiboloader.weiboloader.as_completed", patched_as_completed):
+            with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "a.jpg")):
+                loader.download_target(UserTarget(identifier="222", is_uid=True))
+
+        assert len(ck_saved) == 0, "Checkpoint must not be saved when timeout occurs"
+
+    def test_zero_media_no_timeout(self, tmp_path: Path):
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [make_post("p1", media_items=[])]
+        ctx._posts["u:333:p:1"] = (posts, None)
+
+        ck_saved = []
+        loader._save_ck = lambda key, it: ck_saved.append(key)
+
+        loader.download_target(UserTarget(identifier="333", is_uid=True))
+
+        assert len(ck_saved) == 1
+
+    def test_media_done_count_equals_media_total(self, tmp_path: Path):
+        from weiboloader.ui import EventKind
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        posts = [self._make_post("p1", [f"http://example.com/{i}.jpg" for i in range(4)])]
+        ctx._posts["u:444:p:1"] = (posts, None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "x.jpg")):
+            loader.download_target(UserTarget(identifier="444", is_uid=True))
+
+        media_events = [e for e in sink.events if e.kind == EventKind.MEDIA_DONE]
+        assert len(media_events) == 4

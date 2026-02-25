@@ -22,6 +22,7 @@ class MockContext:
     """Minimal mock for WeiboLoaderContext."""
     def __init__(self):
         self.session = MagicMock()
+        self.req_timeout = 20
         self._posts: dict[str, tuple] = {}
 
     def get_user_info(self, uid):
@@ -252,3 +253,49 @@ class TestNullSink:
         sink.emit(UIEvent(kind=EventKind.STAGE, message="test"))
         sink.close()
         # No exception means pass
+
+
+class TestUIEventExtension:
+    def test_legacy_fields_defaults(self):
+        e = UIEvent(kind=EventKind.STAGE, message="test")
+        assert e.filename is None
+        assert e.post_index is None
+
+    def test_new_fields_preserved(self):
+        e = UIEvent(kind=EventKind.MEDIA_DONE, media_done=1, media_total=5, filename="img.jpg", post_index=3)
+        assert e.filename == "img.jpg"
+        assert e.post_index == 3
+
+    def test_null_sink_accepts_new_fields(self):
+        sink = NullSink()
+        sink.emit(UIEvent(kind=EventKind.MEDIA_DONE, media_done=1, media_total=1, filename="a.jpg", post_index=1))
+
+
+class TestRichSinkMediaDone:
+    def _make_rich_sink(self):
+        from rich.console import Console
+        console = Console(file=open("/dev/null", "w"))
+        sink = RichSink(console)
+        return sink
+
+    def test_description_with_post_index_and_filename(self):
+        sink = self._make_rich_sink()
+        descriptions = []
+        sink._progress.update = lambda task_id, **kw: descriptions.append(kw.get("description", ""))
+        sink.emit(UIEvent(kind=EventKind.MEDIA_DONE, media_done=1, media_total=5, post_index=3, filename="image.jpg"))
+        assert descriptions[-1] == "\\[#3] Media 1/5 - image.jpg"
+
+    def test_description_without_optional_fields(self):
+        sink = self._make_rich_sink()
+        descriptions = []
+        sink._progress.update = lambda task_id, **kw: descriptions.append(kw.get("description", ""))
+        sink.emit(UIEvent(kind=EventKind.MEDIA_DONE, media_done=1, media_total=5))
+        assert descriptions[-1] == "Media 1/5"
+
+    def test_filename_markup_escaped(self):
+        sink = self._make_rich_sink()
+        descriptions = []
+        sink._progress.update = lambda task_id, **kw: descriptions.append(kw.get("description", ""))
+        sink.emit(UIEvent(kind=EventKind.MEDIA_DONE, media_done=1, media_total=5, filename="[bold]evil[/bold]"))
+        desc = descriptions[-1]
+        assert "\\[bold]" in desc

@@ -41,6 +41,8 @@ class UIEvent:
     skipped: int | None = None
     failed: int | None = None
     ok: bool | None = None
+    filename: str | None = None
+    post_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -106,10 +108,13 @@ class RichSink:
         elif kind == EventKind.TARGET_START:
             self._progress.update(self._task_id, description=f"Target: {escape(event.target_key or '')}")
         elif kind == EventKind.MEDIA_DONE:
-            self._progress.update(
-                self._task_id,
-                description=f"Media {event.media_done}/{event.media_total}",
-            )
+            parts: list[str] = []
+            if event.post_index is not None:
+                parts.append(escape(f"[#{event.post_index}]"))
+            parts.append(f"Media {event.media_done}/{event.media_total}")
+            if event.filename:
+                parts.append(f"- {escape(event.filename)}")
+            self._progress.update(self._task_id, description=" ".join(parts))
         elif kind == EventKind.POST_DONE:
             self._progress.update(
                 self._task_id,

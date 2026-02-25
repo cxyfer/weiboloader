@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +21,8 @@ from .ui import DownloadResult, EventKind, MediaOutcome, NullSink, ProgressSink,
 
 logger = logging.getLogger(__name__)
 CST = timezone(timedelta(hours=8))
+_STREAM_READ_TIMEOUT = 60
+_PER_MEDIA_TIMEOUT = 30
 
 
 @dataclass(slots=True)
@@ -160,36 +162,60 @@ class WeiboLoader:
 
                     media_total = len(jobs)
                     media_done = 0
-                    futures = [exe.submit(self._download, m.url, p) for m, p in jobs]
-                    for f in as_completed(futures):
-                        try:
-                            result = f.result()
-                        except Exception:
-                            failed += 1
-                            ok = False
+                    post_index = processed + 1
+                    timed_out = False
+
+                    future_to_path = {exe.submit(self._download, m.url, p): p for m, p in jobs}
+                    post_timeout = max(60, media_total * _PER_MEDIA_TIMEOUT) if future_to_path else None
+                    done_futures: set = set()
+
+                    try:
+                        for f in as_completed(future_to_path, timeout=post_timeout):
+                            done_futures.add(f)
+                            try:
+                                result = f.result()
+                            except Exception:
+                                failed += 1
+                                ok = False
+                                media_done += 1
+                                self._safe_emit(UIEvent(
+                                    kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
+                                    media_done=media_done, media_total=media_total,
+                                    post_index=post_index, filename=future_to_path[f].name,
+                                ))
+                                continue
+                            if result.outcome == MediaOutcome.DOWNLOADED:
+                                downloaded += 1
+                            elif result.outcome == MediaOutcome.SKIPPED:
+                                skipped += 1
+                            else:
+                                failed += 1
+                                ok = False
                             media_done += 1
                             self._safe_emit(UIEvent(
-                                kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
+                                kind=EventKind.MEDIA_DONE, outcome=result.outcome,
                                 media_done=media_done, media_total=media_total,
+                                post_index=post_index, filename=future_to_path[f].name,
                             ))
-                            continue
-                        if result.outcome == MediaOutcome.DOWNLOADED:
-                            downloaded += 1
-                        elif result.outcome == MediaOutcome.SKIPPED:
-                            skipped += 1
-                        else:
-                            failed += 1
-                            ok = False
-                        media_done += 1
-                        self._safe_emit(UIEvent(
-                            kind=EventKind.MEDIA_DONE, outcome=result.outcome,
-                            media_done=media_done, media_total=media_total,
-                        ))
+                    except FuturesTimeoutError:
+                        timed_out = True
+                        for f, path in future_to_path.items():
+                            if f not in done_futures:
+                                f.cancel()
+                                failed += 1
+                                ok = False
+                                media_done += 1
+                                self._safe_emit(UIEvent(
+                                    kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
+                                    media_done=media_done, media_total=media_total,
+                                    post_index=post_index, filename=path.name,
+                                ))
 
                     processed += 1
-                    if newest is None or created > newest:
+                    if not timed_out and (newest is None or created > newest):
                         newest = created
-                    self._save_ck(ck_key, iterator)
+                    if not timed_out:
+                        self._save_ck(ck_key, iterator)
                     self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
             if newest and (cutoff is None or newest > cutoff):
@@ -255,7 +281,10 @@ class WeiboLoader:
         part = dest.with_suffix(".part")
         resp = None
         try:
-            resp = self.context.request("GET", url, bucket="media", allow_captcha=False, stream=True, retries=2)
+            resp = self.context.request(
+                "GET", url, bucket="media", allow_captcha=False, stream=True, retries=2,
+                timeout=(self.context.req_timeout, _STREAM_READ_TIMEOUT),
+            )
             with open(part, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=64 * 1024):
                     if chunk:
@@ -266,6 +295,7 @@ class WeiboLoader:
             return DownloadResult(MediaOutcome.DOWNLOADED, dest)
         except Exception:
             logger.exception("download failed: %s", url)
+            part.unlink(missing_ok=True)
             return DownloadResult(MediaOutcome.FAILED, dest)
         finally:
             if resp:
