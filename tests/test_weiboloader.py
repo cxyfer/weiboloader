@@ -485,22 +485,32 @@ class TestDownloadLoopEnriched:
 
         import concurrent.futures
 
-        original_as_completed = concurrent.futures.as_completed
+        original_wait = concurrent.futures.wait
 
         call_count = [0]
-        def patched_as_completed(fs, timeout=None):
+        def patched_wait(fs, timeout=None, return_when=None):
             call_count[0] += 1
-            if call_count[0] == 1 and timeout is not None:
-                raise concurrent.futures.TimeoutError()
-            return original_as_completed(fs, timeout=timeout)
+            if call_count[0] == 1:
+                return set(), set(fs)
+            return original_wait(fs, timeout=timeout, return_when=return_when)
 
         ck_saved = []
         original_save_ck = loader._save_ck
         loader._save_ck = lambda key, it: ck_saved.append(key)
 
-        with patch("weiboloader.weiboloader.as_completed", patched_as_completed):
-            with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "a.jpg")):
-                loader.download_target(UserTarget(identifier="222", is_uid=True))
+        import time
+        real_monotonic = time.monotonic
+        mono_calls = [0]
+        def fake_monotonic():
+            mono_calls[0] += 1
+            if mono_calls[0] > 3:
+                return real_monotonic() + 99999
+            return real_monotonic()
+
+        with patch("weiboloader.weiboloader.wait", patched_wait):
+            with patch("time.monotonic", fake_monotonic):
+                with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "a.jpg")):
+                    loader.download_target(UserTarget(identifier="222", is_uid=True))
 
         assert len(ck_saved) == 0, "Checkpoint must not be saved when timeout occurs"
 

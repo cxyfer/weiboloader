@@ -7,7 +7,7 @@ import os
 import tempfile
 import time
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -154,37 +154,43 @@ class WeiboLoader:
 
         self._safe_emit(UIEvent(kind=EventKind.TARGET_START, target_key=resolved.key))
 
+        exe = None
+        shutdown_done = False
         try:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as exe:
-                for post in iterator:
-                    if self.count and processed >= self.count:
-                        break
+            exe = ThreadPoolExecutor(max_workers=self.max_workers)
+            for post in iterator:
+                if self.count and processed >= self.count:
+                    break
 
-                    created = self._cst(post.created_at)
-                    if cutoff and created <= cutoff:
-                        break
+                created = self._cst(post.created_at)
+                if cutoff and created <= cutoff:
+                    break
 
-                    jobs = self._media_jobs(target_dir, post)
-                    if self.fast_update and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
-                        break
+                jobs = self._media_jobs(target_dir, post)
+                if self.fast_update and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
+                    break
 
-                    if self.metadata_json:
-                        self._write_json(target_dir, post)
-                    if self.post_metadata_txt:
-                        self._write_txt(target_dir, post)
+                if self.metadata_json:
+                    self._write_json(target_dir, post)
+                if self.post_metadata_txt:
+                    self._write_txt(target_dir, post)
 
-                    media_total = len(jobs)
-                    media_done = 0
-                    post_index = processed + 1
-                    timed_out = False
+                media_total = len(jobs)
+                media_done = 0
+                post_index = processed + 1
+                timed_out = False
 
-                    future_to_path = {exe.submit(self._download, m.url, p): p for m, p in jobs}
-                    post_timeout = max(60, media_total * _PER_MEDIA_TIMEOUT) if future_to_path else None
-                    done_futures: set = set()
+                future_to_path = {exe.submit(self._download, m.url, p): p for m, p in jobs}
+                post_timeout = max(60, media_total * _PER_MEDIA_TIMEOUT) if future_to_path else None
 
-                    try:
-                        for f in as_completed(future_to_path, timeout=post_timeout):
-                            done_futures.add(f)
+                if future_to_path:
+                    deadline = time.monotonic() + post_timeout
+                    pending = set(future_to_path)
+                    while pending:
+                        remaining = deadline - time.monotonic()
+                        poll_timeout = max(0, min(0.5, remaining))
+                        done_batch, pending = wait(pending, timeout=poll_timeout, return_when=FIRST_COMPLETED)
+                        for f in done_batch:
                             try:
                                 result = f.result()
                             except Exception:
@@ -210,10 +216,9 @@ class WeiboLoader:
                                 media_done=media_done, media_total=media_total,
                                 post_index=post_index, filename=future_to_path[f].name,
                             ))
-                    except FuturesTimeoutError:
-                        timed_out = True
-                        for f, path in future_to_path.items():
-                            if f not in done_futures:
+                        if pending and time.monotonic() >= deadline:
+                            timed_out = True
+                            for f in pending:
                                 f.cancel()
                                 failed += 1
                                 ok = False
@@ -221,15 +226,16 @@ class WeiboLoader:
                                 self._safe_emit(UIEvent(
                                     kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
                                     media_done=media_done, media_total=media_total,
-                                    post_index=post_index, filename=path.name,
+                                    post_index=post_index, filename=future_to_path[f].name,
                                 ))
+                            break
 
-                    processed += 1
-                    if not timed_out and (newest is None or created > newest):
-                        newest = created
-                    if not timed_out:
-                        self._save_ck(ck_key, iterator)
-                    self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
+                processed += 1
+                if not timed_out and (newest is None or created > newest):
+                    newest = created
+                if not timed_out:
+                    self._save_ck(ck_key, iterator)
+                self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
             if newest and (cutoff is None or newest > cutoff):
                 self._stamps[resolved.key] = newest
@@ -244,6 +250,9 @@ class WeiboLoader:
             return ok
 
         except KeyboardInterrupt:
+            if exe is not None and not shutdown_done:
+                exe.shutdown(wait=False, cancel_futures=True)
+                shutdown_done = True
             self._safe_emit(UIEvent(kind=EventKind.INTERRUPTED, target_key=resolved.key))
             self._safe_emit(UIEvent(
                 kind=EventKind.TARGET_DONE, target_key=resolved.key,
@@ -262,6 +271,9 @@ class WeiboLoader:
             self._handle_error(ck_key, iterator, newest, cutoff)
             return False
         finally:
+            if exe is not None and not shutdown_done:
+                exe.shutdown(wait=True)
+                shutdown_done = True
             self._active_iters.pop(ck_key, None)
 
     def _create_iterator(self, target: TargetSpec) -> _PostIterator:
