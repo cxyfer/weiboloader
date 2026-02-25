@@ -25,38 +25,87 @@ class MockRateController:
 class TestSessionPersistence:
     def test_save_load_roundtrip(self, tmp_path: Path):
         """PBT: Load(Save(Session)) == Session."""
-        session_path = tmp_path / "session.dat"
-        ctx = WeiboLoaderContext(session_path=session_path)
+        session_file = tmp_path / "session_12345.dat"
+        ctx = WeiboLoaderContext(session_path=tmp_path / "session.dat")
         ctx.session.cookies.set("SUB", "test_value", domain=".weibo.cn")
 
-        ctx.save_session()
-        assert session_path.exists()
+        ctx.save_session(uid="12345")
+        assert session_file.exists()
 
-        ctx2 = WeiboLoaderContext(session_path=session_path)
+        ctx2 = WeiboLoaderContext(session_path=tmp_path / "session.dat")
         assert ctx2.load_session() is True
         assert ctx2.session.cookies.get("SUB", domain=".weibo.cn") == "test_value"
+
+    def test_save_with_explicit_path(self, tmp_path: Path):
+        session_file = tmp_path / "explicit.dat"
+        ctx = WeiboLoaderContext(session_path=tmp_path / "session.dat")
+        ctx.session.cookies.set("SUB", "test_value", domain=".weibo.cn")
+        ctx.save_session(path=session_file)
+        assert session_file.exists()
 
     def test_load_nonexistent_returns_false(self, tmp_path: Path):
         ctx = WeiboLoaderContext(session_path=tmp_path / "nonexistent.dat")
         assert ctx.load_session() is False
 
     def test_load_corrupt_returns_false(self, tmp_path: Path):
-        session_path = tmp_path / "session.dat"
+        session_path = tmp_path / "session_bad.dat"
         session_path.write_text("not valid json", encoding="utf-8")
-        ctx = WeiboLoaderContext(session_path=session_path)
+        ctx = WeiboLoaderContext(session_path=tmp_path / "session.dat")
         assert ctx.load_session() is False
 
+    def test_load_picks_most_recent(self, tmp_path: Path):
+        import time
+        ctx1 = WeiboLoaderContext(session_path=tmp_path / "session.dat")
+        ctx1.session.cookies.set("SUB", "old_value", domain=".weibo.cn")
+        ctx1.save_session(uid="111")
+        time.sleep(0.05)
+        ctx2 = WeiboLoaderContext(session_path=tmp_path / "session.dat")
+        ctx2.session.cookies.set("SUB", "new_value", domain=".weibo.cn")
+        ctx2.save_session(uid="222")
 
-class TestCookieValidation:
-    def test_validate_with_sub_passes(self):
-        ctx = WeiboLoaderContext()
-        ctx.session.cookies.set("SUB", "value", domain=".weibo.cn")
-        ctx.validate_cookie()
+        ctx3 = WeiboLoaderContext(session_path=tmp_path / "session.dat")
+        assert ctx3.load_session() is True
+        assert ctx3.session.cookies.get("SUB", domain=".weibo.cn") == "new_value"
 
-    def test_validate_without_sub_raises(self):
-        ctx = WeiboLoaderContext()
-        with pytest.raises(AuthError, match="missing SUB cookie"):
-            ctx.validate_cookie()
+
+class TestVerifyLogin:
+    @responses.activate
+    def test_login_true_returns_uid(self):
+        responses.get(
+            "https://m.weibo.cn/api/config",
+            json={"data": {"login": True, "uid": 12345}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        ok, uid = ctx.verify_login()
+        assert ok is True
+        assert uid == "12345"
+
+    @responses.activate
+    def test_login_false(self):
+        responses.get(
+            "https://m.weibo.cn/api/config",
+            json={"data": {"login": False}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        ok, uid = ctx.verify_login()
+        assert ok is False
+        assert uid is None
+
+    @responses.activate
+    def test_network_error_returns_none(self):
+        responses.get("https://m.weibo.cn/api/config", body=ConnectionError("fail"))
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        ok, uid = ctx.verify_login()
+        assert ok is None
+        assert uid is None
+
+    @responses.activate
+    def test_missing_data_returns_none(self):
+        responses.get("https://m.weibo.cn/api/config", json={"ok": 1})
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        ok, uid = ctx.verify_login()
+        assert ok is None
+        assert uid is None
 
 
 class TestCookieFromString:

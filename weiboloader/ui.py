@@ -20,6 +20,7 @@ class EventKind(str, Enum):
     MEDIA_DONE = "media_done"
     TARGET_DONE = "target_done"
     INTERRUPTED = "interrupted"
+    LOGIN_STATUS = "login_status"
 
 
 class MediaOutcome(str, Enum):
@@ -43,6 +44,8 @@ class UIEvent:
     ok: bool | None = None
     filename: str | None = None
     post_index: int | None = None
+    login_ok: bool | None = None
+    uid: str | None = None
 
 
 @dataclass(slots=True)
@@ -135,3 +138,11 @@ class RichSink:
                 )
         elif kind == EventKind.INTERRUPTED:
             self._progress.update(self._task_id, description=f"Interrupted: {escape(event.target_key or '')}")
+        elif kind == EventKind.LOGIN_STATUS:
+            if event.login_ok is True:
+                self._console.print(f"[green]✓[/green] Logged in: @{escape(event.uid or 'unknown')}")
+            elif event.login_ok is False:
+                msg = event.message or "Not logged in"
+                self._console.print(f"[red]✗[/red] {escape(msg)}")
+            else:
+                self._console.print("[yellow]⚠[/yellow] Login status unknown")

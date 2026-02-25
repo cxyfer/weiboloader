@@ -137,24 +137,30 @@ def main(argv: list[str] | None = None) -> int:
             on_captcha_resume=captcha_resume,
         )
 
-        has_auth = context.load_session(args.sessionfile)
-        if args.load_cookies:
-            context.load_browser_cookies(args.load_cookies)
-            has_auth = True
-        if args.cookie:
-            context.set_cookies_from_string(args.cookie)
-            has_auth = True
-        if args.cookie_file:
-            context.set_cookies_from_file(args.cookie_file)
-            has_auth = True
-        if args.visitor_cookies:
+        has_explicit_cookies = bool(args.load_cookies or args.cookie or args.cookie_file)
+
+        if has_explicit_cookies:
+            if args.load_cookies:
+                context.load_browser_cookies(args.load_cookies)
+            if args.cookie:
+                context.set_cookies_from_string(args.cookie)
+            if args.cookie_file:
+                context.set_cookies_from_file(args.cookie_file)
+            login_ok, uid = context.verify_login()
+            sink.emit(UIEvent(kind=EventKind.LOGIN_STATUS, login_ok=login_ok, uid=uid))
+            if login_ok is True:
+                context.save_session(uid=uid, path=args.sessionfile)
+        elif args.visitor_cookies:
             sink.emit(UIEvent(kind=EventKind.STAGE, message="Fetching visitor cookies"))
             context.fetch_visitor_cookies()
-            has_auth = True
-
-        if has_auth:
-            context.validate_cookie()
-            context.save_session(args.sessionfile)
+        else:
+            loaded = context.load_session(args.sessionfile)
+            if loaded:
+                login_ok, uid = context.verify_login()
+                msg = "Session expired" if login_ok is False else None
+                sink.emit(UIEvent(kind=EventKind.LOGIN_STATUS, login_ok=login_ok, uid=uid, message=msg))
+                if login_ok is True:
+                    context.save_session(uid=uid, path=args.sessionfile)
 
         if args.post_filter:
             print("warning: --post-filter is not implemented yet and will be ignored", file=sys.stderr)

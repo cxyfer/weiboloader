@@ -189,13 +189,33 @@ class WeiboLoaderContext:
         for name, value in cookies.items():
             self.session.cookies.set(name, value, domain=".weibo.cn", path="/")
 
-    def validate_cookie(self) -> None:
-        has_sub = any(c.name == "SUB" and c.value for c in self.session.cookies)
-        if not has_sub:
-            raise AuthError("missing SUB cookie")
+    def verify_login(self) -> tuple[bool | None, str | None]:
+        try:
+            resp = self.request("GET", "api/config", allow_captcha=False, retries=1, timeout=10)
+            try:
+                body = resp.json()
+            finally:
+                resp.close()
+            data = body.get("data", {})
+            if data.get("login") is True:
+                uid = str(data["uid"]) if "uid" in data and data["uid"] else "unknown"
+                return (True, uid)
+            if data.get("login") is False:
+                return (False, None)
+            return (None, None)
+        except Exception:
+            return (None, None)
 
-    def save_session(self, path: str | Path | None = None) -> Path:
-        p = Path(path).expanduser() if path else self._session_path
+    def save_session(self, uid: str | None = None, path: str | Path | None = None) -> Path:
+        if path:
+            p = Path(path).expanduser()
+        elif uid:
+            safe_uid = re.sub(r"[^a-zA-Z0-9_-]", "", uid)
+            if not safe_uid:
+                safe_uid = "unknown"
+            p = self._session_path.parent / f"session_{safe_uid}.dat"
+        else:
+            p = self._session_path
         p.parent.mkdir(parents=True, exist_ok=True)
         # Serialize cookies as list of dicts to avoid pickle security risk
         cookie_list = [
@@ -208,9 +228,23 @@ class WeiboLoaderContext:
         return p
 
     def load_session(self, path: str | Path | None = None) -> bool:
-        p = Path(path).expanduser() if path else self._session_path
-        if not p.exists():
+        if path:
+            p = Path(path).expanduser()
+            if not p.exists():
+                return False
+            return self._load_session_file(p)
+        session_dir = self._session_path.parent
+        if not session_dir.is_dir():
             return False
+        candidates = sorted(session_dir.glob("session_*.dat"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for c in candidates:
+            if self._load_session_file(c):
+                return True
+        if self._session_path.exists():
+            return self._load_session_file(self._session_path)
+        return False
+
+    def _load_session_file(self, p: Path) -> bool:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 payload = json.load(f)
