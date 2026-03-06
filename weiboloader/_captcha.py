@@ -42,9 +42,11 @@ class PlaywrightCaptchaHandler:
 
                 while time.monotonic() < deadline:
                     if not _is_captcha_url(page.url):
-                        for c in ctx.cookies():
-                            session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
-                        return True
+                        ctx_cookies = ctx.cookies()
+                        if any(c["name"] == "SUB" and c["value"] for c in ctx_cookies):
+                            for c in ctx_cookies:
+                                session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+                            return True
                     time.sleep(1)
                 return not _is_captcha_url(page.url)
             finally:
@@ -82,6 +84,8 @@ def is_playwright_available() -> bool:
 
 def _is_captcha_url(url: str) -> bool:
     parts = urlparse(url)
+    if parts.netloc == "passport.weibo.com" and parts.path.startswith("/visitor/"):
+        return False
     text = f"{parts.netloc}{parts.path}".lower()
     return any(h in text for h in ("passport.weibo", "login.sina", "verify", "captcha", "challenge"))
 

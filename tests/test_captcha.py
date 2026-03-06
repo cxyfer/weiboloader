@@ -37,6 +37,8 @@ class TestIsCaptchaUrl:
             ("https://weibo.com/captcha/test", True),
             ("https://api.weibo.cn/2/statuses", False),
             ("https://m.weibo.cn/detail/123", False),
+            ("https://passport.weibo.com/visitor/visitor?a=visitor", False),
+            ("https://passport.weibo.com/visitor/gen_token", False),
         ],
     )
     def test_detection(self, url, expected):

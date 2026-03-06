@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -25,6 +26,8 @@ from .structures import Post, SuperTopic, User
 
 Browser = Literal["chrome", "firefox", "edge"]
 CaptchaMode = Literal["auto", "browser", "manual", "skip"]
+
+logger = logging.getLogger(__name__)
 
 
 class WeiboLoaderContext:
@@ -261,7 +264,8 @@ class WeiboLoaderContext:
 
     def resolve_nickname_to_uid(self, nickname: str) -> str:
         name = quote(nickname.strip(), safe="")
-        resp = self.request("GET", f"/n/{name}", allow_redirects=False, retries=2)
+        resp = self.request("GET", f"/n/{name}", allow_redirects=False,
+                            allow_captcha=False, retries=2)
         loc = resp.headers.get("Location", "")
         resp.close()
 
@@ -347,6 +351,7 @@ class WeiboLoaderContext:
         try:
             return handler.solve(url, self.session, self.captcha_timeout)
         except Exception:
+            logger.debug("captcha handler raised", exc_info=True)
             return False
         finally:
             if self._on_captcha_resume:

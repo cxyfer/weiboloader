@@ -244,6 +244,25 @@ class TestResolveNickname:
         with pytest.raises(TargetError, match="cannot resolve nickname"):
             ctx.resolve_nickname_to_uid("testuser")
 
+    def test_resolve_redirect_request_disables_captcha(self):
+        """First /n/{name} request must carry allow_captcha=False."""
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        calls: list[dict] = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append({"url": url, "allow_captcha": kwargs.get("allow_captcha", True)})
+            mock_resp = MagicMock()
+            mock_resp.headers = {"Location": "https://m.weibo.cn/u/111222333"}
+            mock_resp.url = url
+            mock_resp.status_code = 302
+            return mock_resp
+
+        with patch.object(ctx, "request", side_effect=fake_request):
+            uid = ctx.resolve_nickname_to_uid("testuser")
+
+        assert uid == "111222333"
+        assert calls[0]["allow_captcha"] is False
+
 
 class TestGetUserInfo:
     @responses.activate
