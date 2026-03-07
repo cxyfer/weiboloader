@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
@@ -13,7 +14,13 @@ TIMEOUT_DEFAULT = 300
 
 @runtime_checkable
 class CaptchaHandler(Protocol):
-    def solve(self, verify_url: str, session: requests.Session, timeout: int = TIMEOUT_DEFAULT) -> bool:
+    def solve(
+        self,
+        verify_url: str,
+        session: requests.Session,
+        timeout: int = TIMEOUT_DEFAULT,
+        probe: Callable[[], bool] | None = None,
+    ) -> bool:
         ...
 
 
@@ -21,7 +28,13 @@ class PlaywrightCaptchaHandler:
     def __init__(self, headless: bool = False) -> None:
         self.headless = headless
 
-    def solve(self, verify_url: str, session: requests.Session, timeout: int = TIMEOUT_DEFAULT) -> bool:
+    def solve(
+        self,
+        verify_url: str,
+        session: requests.Session,
+        timeout: int = TIMEOUT_DEFAULT,
+        probe: Callable[[], bool] | None = None,
+    ) -> bool:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -41,36 +54,93 @@ class PlaywrightCaptchaHandler:
                 page.goto(verify_url, wait_until="domcontentloaded", timeout=min(timeout, 30) * 1000)
 
                 while time.monotonic() < deadline:
-                    if not _is_captcha_url(page.url):
-                        ctx_cookies = ctx.cookies()
-                        if any(c["name"] == "SUB" and c["value"] for c in ctx_cookies):
-                            for c in ctx_cookies:
-                                session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
-                            return True
+                    _sync_cookies_to_session(session, ctx.cookies())
+                    if probe and _safe_probe(probe):
+                        return True
+                    if _page_done(page):
+                        return True
                     time.sleep(1)
-                return not _is_captcha_url(page.url)
+
+                _sync_cookies_to_session(session, ctx.cookies())
+                if probe and _safe_probe(probe):
+                    return True
+                return _page_done(page)
             finally:
                 browser.close()
 
 
 class ManualCaptchaHandler:
-    def solve(self, verify_url: str, session: requests.Session, timeout: int = TIMEOUT_DEFAULT) -> bool:
+    def solve(
+        self,
+        verify_url: str,
+        session: requests.Session,
+        timeout: int = TIMEOUT_DEFAULT,
+        probe: Callable[[], bool] | None = None,
+    ) -> bool:
         print(f"CAPTCHA: {verify_url}")
         print(f"Press Enter within {timeout}s after solving...")
 
         done = threading.Event()
-        def read():
+
+        def read() -> None:
             try:
                 input()
                 done.set()
-            except EOFError:
+            except (EOFError, OSError):
                 pass
+
         threading.Thread(target=read, daemon=True).start()
-        return done.wait(timeout)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if probe and _safe_probe(probe):
+                return True
+            remaining = max(0.0, min(1.0, deadline - time.monotonic()))
+            if done.wait(remaining):
+                if not probe:
+                    return True
+                if _safe_probe(probe):
+                    return True
+        return _safe_probe(probe) if probe else done.is_set()
 
 
 class SkipCaptchaHandler:
-    def solve(self, verify_url: str, session: requests.Session, timeout: int = TIMEOUT_DEFAULT) -> bool:
+    def solve(
+        self,
+        verify_url: str,
+        session: requests.Session,
+        timeout: int = TIMEOUT_DEFAULT,
+        probe: Callable[[], bool] | None = None,
+    ) -> bool:
+        return False
+
+
+
+def _safe_probe(probe: Callable[[], bool]) -> bool:
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
+def _sync_cookies_to_session(session: requests.Session, cookies: list[dict[str, Any]]) -> None:
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        session.cookies.set(name, value, domain=cookie.get("domain"), path=cookie.get("path", "/"))
+
+
+def _page_done(page: Any) -> bool:
+    try:
+        if page.is_closed():
+            return True
+    except Exception:
+        return False
+    try:
+        return not _is_captcha_url(page.url)
+    except Exception:
         return False
 
 

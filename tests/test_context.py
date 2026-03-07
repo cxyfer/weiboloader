@@ -557,6 +557,35 @@ class TestGetIndexCaptcha:
                 ctx._get_index({"type": "uid", "value": "123"})
 
     @responses.activate
+    def test_probe_recovers_when_handler_cannot_confirm(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "captcha"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": [{"mblog": {"id": "1"}}]}},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+
+        ctx = WeiboLoaderContext(rate_controller=MockRateController(), captcha_mode="manual")
+
+        class ProbeOnlyHandler:
+            def solve(self, verify_url, session, timeout, probe=None):
+                assert probe is not None
+                assert probe() is True
+                return False
+
+        ctx._captcha_handlers["manual"] = ProbeOnlyHandler()
+
+        data = ctx._get_index({"type": "uid", "value": "123"})
+
+        assert data == {"cards": []}
+
+    @responses.activate
     def test_max_attempts_exhausted_raises_target_error(self):
         for _ in range(3):
             responses.get(

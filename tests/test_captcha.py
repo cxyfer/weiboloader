@@ -90,6 +90,20 @@ class TestManualCaptchaHandler:
         result = handler.solve("https://passport.weibo.com/verify", session, timeout=0.01)
         assert isinstance(result, bool)
 
+    @patch("builtins.input", side_effect=EOFError)
+    def test_probe_can_succeed_without_enter(self, mock_input):
+        handler = ManualCaptchaHandler()
+        session = MagicMock(spec=requests.Session)
+
+        result = handler.solve(
+            "https://passport.weibo.com/verify",
+            session,
+            timeout=0.05,
+            probe=lambda: True,
+        )
+
+        assert result is True
+
 
 class TestPlaywrightCaptchaHandler:
     def test_init(self):

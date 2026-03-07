@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -65,6 +66,7 @@ class WeiboLoaderContext:
         self._session_path = self._resolve_path(session_path)
         self._on_captcha_pause = on_captcha_pause
         self._on_captcha_resume = on_captcha_resume
+        self._cookie_source_browser: Browser | None = None
 
         self._captcha_handlers = {
             "manual": ManualCaptchaHandler(),
@@ -172,6 +174,7 @@ class WeiboLoaderContext:
                 loaded = True
         if not loaded:
             raise AuthError("no weibo cookies found")
+        self._cookie_source_browser = browser
 
     def set_cookies_from_string(self, s: str) -> None:
         s = s.strip()
@@ -348,22 +351,48 @@ class WeiboLoaderContext:
             return parse_post(status)
         raise TargetError(f"post not found: {mid}")
 
-    def _solve_captcha(self, url: str) -> bool:
+    def _build_captcha_probe(
+        self,
+        handler: Any,
+        probe: Callable[[], bool] | None,
+    ) -> Callable[[], bool] | None:
+        if probe is None:
+            return None
+
+        def wrapped() -> bool:
+            if isinstance(handler, ManualCaptchaHandler) and self._cookie_source_browser:
+                try:
+                    self.load_browser_cookies(self._cookie_source_browser)
+                except Exception:
+                    logger.debug("failed to refresh browser cookies before captcha probe", exc_info=True)
+            try:
+                return bool(probe())
+            except Exception:
+                logger.debug("captcha probe failed", exc_info=True)
+                return False
+
+        return wrapped
+
+    def _solve_captcha(self, url: str, probe: Callable[[], bool] | None = None) -> bool:
         handler = self._captcha_handlers.get(self.captcha_mode)
         if self.captcha_mode == "auto":
             handler = self._captcha_handlers["browser"] if is_playwright_available() else self._captcha_handlers["manual"]
         if not handler:
             raise AuthError(f"captcha mode not available: {self.captcha_mode}")
+        probe = self._build_captcha_probe(handler, probe)
         if self._on_captcha_pause:
             try:
                 self._on_captcha_pause()
             except Exception:
                 pass
         try:
-            return handler.solve(url, self.session, self.captcha_timeout)
+            solved = handler.solve(url, self.session, self.captcha_timeout, probe=probe)
+            if not solved and probe:
+                return probe()
+            return solved
         except Exception:
             logger.debug("captcha handler raised", exc_info=True)
-            return False
+            return probe() if probe else False
         finally:
             if self._on_captcha_resume:
                 try:
@@ -378,19 +407,46 @@ class WeiboLoaderContext:
         finally:
             resp.close()
 
+    def _get_index_payload(
+        self,
+        params: dict[str, Any],
+        *,
+        allow_captcha: bool = True,
+        retries: int = 3,
+    ) -> dict[str, Any]:
+        return self._get_json(
+            "/api/container/getIndex",
+            params=params,
+            allow_captcha=allow_captcha,
+            retries=retries,
+        )
+
+    def _probe_index_ready(self, params: dict[str, Any]) -> bool:
+        payload = self._get_index_payload(params, allow_captcha=False, retries=0)
+        return isinstance(payload.get("data"), dict)
+
     def _get_index(self, params: dict[str, Any]) -> dict[str, Any]:
         _CAPTCHA_URL = "https://m.weibo.cn/captcha/show?backUrl=https%3A%2F%2Fm.weibo.cn%2F"
         _MAX_CAPTCHA_ATTEMPTS = 2
+        _RECOVERY_POLLS = 2
+        _RECOVERY_DELAY = 1.0
 
         for attempt in range(_MAX_CAPTCHA_ATTEMPTS + 1):
-            payload = self._get_json("/api/container/getIndex", params=params)
+            payload = self._get_index_payload(params)
             if isinstance(data := payload.get("data"), dict):
                 return data
 
             if self.captcha_mode == "skip":
                 raise RateLimitError(payload.get("msg") or "rate limited (captcha)")
             if attempt < _MAX_CAPTCHA_ATTEMPTS:
-                if self._solve_captcha(_CAPTCHA_URL):
+                solved = self._solve_captcha(_CAPTCHA_URL, probe=lambda: self._probe_index_ready(params))
+                if solved:
+                    for poll in range(_RECOVERY_POLLS):
+                        if poll:
+                            time.sleep(_RECOVERY_DELAY)
+                        payload = self._get_index_payload(params, allow_captcha=False, retries=0)
+                        if isinstance(data := payload.get("data"), dict):
+                            return data
                     continue
                 raise AuthError("captcha not solved")
 
