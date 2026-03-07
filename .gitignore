@@ -222,6 +222,10 @@ __marimo__/
 .gemini/
 .opsx/
 .agent/
+.omc/
+.omx/
+AGENTS.md
+CLAUDE.md
 
 # Reference repos
 references/
