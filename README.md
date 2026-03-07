@@ -16,7 +16,7 @@
 - Customizable file/directory naming with template patterns
 - Incremental download with `--fast-update` and `--latest-stamps`
 - Resumable downloads with checkpoint support
-- Sliding-window rate control with exponential backoff
+- API sliding-window rate control (default: 60 requests / 600s) with exponential backoff
 - Captcha handling: auto (Playwright), browser-based, manual, or skip
 - Cookie authentication: browser import, string, file, session persistence
 - Visitor cookie auto-fetch via headless Playwright
@@ -95,9 +95,18 @@ weiboloader --visitor-cookies 1234567890
 --fast-update            Stop at first existing file
 --latest-stamps FILE     Track latest download timestamps
 --no-resume              Disable checkpoint resume
---request-interval SEC   Minimum seconds between API requests
+--request-interval SEC   Minimum seconds between requests per bucket
+--api-rate-limit N       API sliding-window quota (default: 60)
+--api-rate-window SEC    API sliding-window window in seconds (default: 600)
 --captcha-mode MODE      auto|browser|manual|skip (default: auto)
 ```
+
+### Request pacing
+
+- API requests use a sliding-window quota of 60 requests per 600 seconds by default.
+- Override the API quota with `--api-rate-limit` and `--api-rate-window`.
+- `--request-interval` applies separately to the `api` and `media` buckets.
+- Media requests are isolated from API quota usage and do not use the sliding-window quota.
 
 ### Naming Patterns
 

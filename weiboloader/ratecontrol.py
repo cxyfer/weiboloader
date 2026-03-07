@@ -35,7 +35,7 @@ class BaseRateController(ABC):
 class SlidingWindowRateController(BaseRateController):
     def __init__(
         self,
-        api_limit: int = 30,
+        api_limit: int = 60,
         api_window: float = 600,
         base_delay: float = 30,
         max_delay: float = 600,
@@ -67,21 +67,19 @@ class SlidingWindowRateController(BaseRateController):
                 state = self._state[bucket]
                 now = self._now()
 
-                # Clean old timestamps
-                while state.timestamps and now - state.timestamps[0] >= cfg.window:
-                    state.timestamps.popleft()
-
-                # Calculate required wait
                 wait = 0.0
-                if len(state.timestamps) >= cfg.limit:
-                    wait = max(wait, state.timestamps[0] + cfg.window - now)
-                if bucket == "api" and self.request_interval > 0 and state.last_request_at is not None:
+                if bucket == "api":
+                    while state.timestamps and now - state.timestamps[0] >= cfg.window:
+                        state.timestamps.popleft()
+                    if len(state.timestamps) >= cfg.limit:
+                        wait = max(wait, state.timestamps[0] + cfg.window - now)
+                if self.request_interval > 0 and state.last_request_at is not None:
                     wait = max(wait, state.last_request_at + self.request_interval - now)
                 wait = max(wait, state.backoff_until - now)
 
                 if wait <= 0:
-                    # Atomic: record timestamp while holding lock
-                    state.timestamps.append(now)
+                    if bucket == "api":
+                        state.timestamps.append(now)
                     state.last_request_at = now
                     return
 

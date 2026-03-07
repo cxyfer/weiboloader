@@ -111,6 +111,11 @@ class TestDownloadMedia:
         assert result is not None
         assert result.outcome == MediaOutcome.DOWNLOADED
         assert dest.read_bytes() == b"new data"
+        _, url = mock_req.call_args[0]
+        assert url == "http://example.com/img.jpg"
+        assert mock_req.call_args.kwargs["bucket"] == "media"
+        assert mock_req.call_args.kwargs["allow_captcha"] is False
+        assert mock_req.call_args.kwargs["retries"] == 2
 
     def test_part_file_rename(self, tmp_path: Path):
         ctx = MockContext()

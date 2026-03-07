@@ -88,6 +88,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--request-interval", type=float, default=0.0)
+    parser.add_argument("--api-rate-limit", type=int, default=60)
+    parser.add_argument("--api-rate-window", type=float, default=600)
     parser.add_argument("--captcha-mode", choices=("auto", "browser", "manual", "skip"), default="auto")
     parser.add_argument("--visitor-cookies", action="store_true",
                         help="Auto-fetch visitor cookies via Playwright (requires playwright)")
@@ -98,6 +100,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--count must be >= 0")
     if args.request_interval < 0:
         parser.error("--request-interval must be >= 0")
+    if args.api_rate_limit <= 0:
+        parser.error("--api-rate-limit must be > 0")
+    if args.api_rate_window <= 0:
+        parser.error("--api-rate-window must be > 0")
     if not args.targets and not args.mid:
         parser.error("at least one target or -mid/--mid is required")
 
@@ -130,7 +136,11 @@ def main(argv: list[str] | None = None) -> int:
         captcha_resume = getattr(sink, "resume", None)
 
         context = WeiboLoaderContext(
-            rate_controller=SlidingWindowRateController(request_interval=args.request_interval),
+            rate_controller=SlidingWindowRateController(
+                api_limit=args.api_rate_limit,
+                api_window=args.api_rate_window,
+                request_interval=args.request_interval,
+            ),
             captcha_mode=args.captcha_mode,
             session_path=args.sessionfile,
             on_captcha_pause=captcha_pause,

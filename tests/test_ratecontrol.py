@@ -52,6 +52,19 @@ class TestSlidingWindowQuota:
         # Should have waited until time 10 (when first request expires from window)
         assert elapsed >= 6  # 10 - 3 = 7, but give some margin
 
+    def test_api_default_window_quota_blocks_61st_request(self):
+        controller = SlidingWindowRateController(jitter_ratio=0.0)
+        clock = FakeClock()
+        bind_fake_clock(controller, clock)
+
+        for _ in range(60):
+            controller.wait_before_request("api")
+
+        start = clock.now()
+        controller.wait_before_request("api")
+
+        assert clock.now() - start == pytest.approx(600.0)
+
     def test_api_and_media_bucket_isolation(self):
         """PBT: API and media buckets do not cross-pollute."""
         controller = SlidingWindowRateController(
@@ -69,6 +82,22 @@ class TestSlidingWindowQuota:
         controller.wait_before_request("media")
         after = clock.now()
         assert after == before
+
+    def test_media_bucket_has_no_sliding_window_quota(self):
+        controller = SlidingWindowRateController(
+            api_limit=1,
+            api_window=10,
+            request_interval=0.0,
+            jitter_ratio=0.0,
+        )
+        clock = FakeClock()
+        bind_fake_clock(controller, clock)
+
+        controller.wait_before_request("media")
+        controller.wait_before_request("media")
+        controller.wait_before_request("media")
+
+        assert clock.now() == pytest.approx(0.0)
 
 
 class TestBackoff:
@@ -95,6 +124,27 @@ class TestBackoff:
         assert waits == sorted(waits)
         assert waits[0] == pytest.approx(4.0)
         assert waits[1] == pytest.approx(8.0)
+
+    def test_media_backoff_applies_to_403_and_418(self):
+        controller = SlidingWindowRateController(
+            api_limit=10,
+            api_window=600,
+            base_delay=4,
+            max_delay=100,
+            jitter_ratio=0.0,
+        )
+        clock = FakeClock()
+        bind_fake_clock(controller, clock)
+
+        controller.handle_response("media", 403)
+        start = clock.now()
+        controller.wait_before_request("media")
+        assert clock.now() - start == pytest.approx(4.0)
+
+        controller.handle_response("media", 418)
+        start = clock.now()
+        controller.wait_before_request("media")
+        assert clock.now() - start == pytest.approx(8.0)
 
     def test_backoff_resets_after_success(self):
         controller = SlidingWindowRateController(
@@ -139,6 +189,31 @@ class TestRequestInterval:
 
         # The second request should wait 5s after the first
         assert second_at - first_at >= 5.0
+
+    def test_request_interval_applies_to_media_and_is_bucket_local(self):
+        controller = SlidingWindowRateController(
+            api_limit=10,
+            api_window=600,
+            request_interval=5.0,
+            jitter_ratio=0.0,
+        )
+        clock = FakeClock()
+        bind_fake_clock(controller, clock)
+
+        controller.wait_before_request("media")
+        controller.wait_before_request("api")
+
+        api_start = clock.now()
+        controller.wait_before_request("api")
+        assert clock.now() - api_start == pytest.approx(5.0)
+
+        media_start = clock.now()
+        controller.wait_before_request("media")
+        assert clock.now() - media_start == pytest.approx(0.0)
+
+        media_start = clock.now()
+        controller.wait_before_request("media")
+        assert clock.now() - media_start == pytest.approx(5.0)
 
 
 @given(st.integers(min_value=10, max_value=100))

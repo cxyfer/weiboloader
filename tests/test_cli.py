@@ -123,6 +123,8 @@ class TestParseArgs:
             "--latest-stamps", "/tmp/stamps.json",
             "--no-resume",
             "--request-interval", "1.5",
+            "--api-rate-limit", "42",
+            "--api-rate-window", "123.5",
             "--captcha-mode", "skip",
             "123"
         ])
@@ -131,7 +133,14 @@ class TestParseArgs:
         assert args.latest_stamps == "/tmp/stamps.json"
         assert args.no_resume is True
         assert args.request_interval == 1.5
+        assert args.api_rate_limit == 42
+        assert args.api_rate_window == 123.5
         assert args.captcha_mode == "skip"
+
+    def test_api_rate_defaults(self):
+        args = parse_args(["123456"])
+        assert args.api_rate_limit == 60
+        assert args.api_rate_window == 600
 
     def test_negative_count_error(self):
         with pytest.raises(SystemExit):
@@ -140,6 +149,14 @@ class TestParseArgs:
     def test_negative_interval_error(self):
         with pytest.raises(SystemExit):
             parse_args(["--request-interval", "-1", "123"])
+
+    def test_non_positive_api_rate_limit_error(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--api-rate-limit", "0", "123"])
+
+    def test_non_positive_api_rate_window_error(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--api-rate-window", "0", "123"])
 
     def test_no_target_error(self):
         with pytest.raises(SystemExit):
