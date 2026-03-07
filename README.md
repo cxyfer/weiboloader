@@ -105,9 +105,10 @@ weiboloader --visitor-cookies 1234567890
 --fast-update            Stop at first existing file
 --latest-stamps FILE     Track latest download timestamps
 --no-resume              Disable checkpoint resume
---request-interval SEC   Minimum seconds between requests per bucket
+--request-interval SEC   Minimum seconds between requests per bucket (default: 1)
 --api-rate-limit N       API sliding-window quota (default: 60)
 --api-rate-window SEC    API sliding-window window in seconds (default: 600)
+--workers N              Concurrent media download workers (default: 1)
 --captcha-mode MODE      auto|browser|manual|skip (default: auto)
 ```
 
@@ -115,8 +116,9 @@ weiboloader --visitor-cookies 1234567890
 
 - API requests use a sliding-window quota of 60 requests per 600 seconds by default.
 - Override the API quota with `--api-rate-limit` and `--api-rate-window`.
-- `--request-interval` applies separately to the `api` and `media` buckets.
+- `--request-interval` defaults to 1 second and applies separately to the `api` and `media` buckets.
 - Media requests are isolated from API quota usage and do not use the sliding-window quota.
+- Media downloads use 1 worker by default; override with `--workers`.
 
 ### Naming Patterns
 

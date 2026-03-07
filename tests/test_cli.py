@@ -1,9 +1,12 @@
 """Tests for CLI (Phase 5.1)."""
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from hypothesis import given, strategies as st
 
+import weiboloader.__main__ as cli_main
 from weiboloader.__main__ import _extract_mid_from_url, _looks_like_containerid, parse_args, parse_target
 from weiboloader.exceptions import InitError
 from weiboloader.structures import MidTarget, SearchTarget, SuperTopicTarget, UserTarget
@@ -125,6 +128,7 @@ class TestParseArgs:
             "--request-interval", "1.5",
             "--api-rate-limit", "42",
             "--api-rate-window", "123.5",
+            "--workers", "7",
             "--captcha-mode", "skip",
             "123"
         ])
@@ -135,12 +139,15 @@ class TestParseArgs:
         assert args.request_interval == 1.5
         assert args.api_rate_limit == 42
         assert args.api_rate_window == 123.5
+        assert args.workers == 7
         assert args.captcha_mode == "skip"
 
     def test_api_rate_defaults(self):
         args = parse_args(["123456"])
+        assert args.request_interval == 1.0
         assert args.api_rate_limit == 60
         assert args.api_rate_window == 600
+        assert args.workers == 1
 
     def test_negative_count_error(self):
         with pytest.raises(SystemExit):
@@ -158,6 +165,10 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args(["--api-rate-window", "0", "123"])
 
+    def test_non_positive_workers_error(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--workers", "0", "123"])
+
     def test_no_target_error(self):
         with pytest.raises(SystemExit):
             parse_args([])
@@ -166,6 +177,25 @@ class TestParseArgs:
         args = parse_args(["user1", "user2", "#topic"])
         assert args.targets == ["user1", "user2", "#topic"]
 
+
+class TestMainRuntimeDefaults:
+    def test_main_passes_default_interval_and_workers(self):
+        fake_context = MagicMock()
+        fake_context.load_session.return_value = False
+
+        fake_loader = MagicMock()
+        fake_loader.download_targets.return_value = {"u:123456": True}
+
+        rate_controller = object()
+        with patch.object(cli_main, "SlidingWindowRateController", return_value=rate_controller) as mock_rate:
+            with patch.object(cli_main, "WeiboLoaderContext", return_value=fake_context) as mock_context_cls:
+                with patch.object(cli_main, "WeiboLoader", return_value=fake_loader) as mock_loader_cls:
+                    code = cli_main.main(["123456"])
+
+        assert code == 0
+        mock_rate.assert_called_once_with(api_limit=60, api_window=600, request_interval=1.0)
+        assert mock_context_cls.call_args.kwargs["rate_controller"] is rate_controller
+        assert mock_loader_cls.call_args.kwargs["max_workers"] == 1
 
 class TestExitCodeProperty:
     @given(st.lists(st.text(min_size=1), min_size=1, max_size=5))

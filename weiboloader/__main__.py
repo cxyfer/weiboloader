@@ -87,9 +87,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--latest-stamps")
 
     parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--request-interval", type=float, default=0.0)
+    parser.add_argument("--request-interval", type=float, default=1.0)
     parser.add_argument("--api-rate-limit", type=int, default=60)
     parser.add_argument("--api-rate-window", type=float, default=600)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--captcha-mode", choices=("auto", "browser", "manual", "skip"), default="auto")
     parser.add_argument("--visitor-cookies", action="store_true",
                         help="Auto-fetch visitor cookies via Playwright (requires playwright)")
@@ -104,6 +105,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--api-rate-limit must be > 0")
     if args.api_rate_window <= 0:
         parser.error("--api-rate-window must be > 0")
+    if args.workers <= 0:
+        parser.error("--workers must be > 0")
     if not args.targets and not args.mid:
         parser.error("at least one target or -mid/--mid is required")
 
@@ -186,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             latest_stamps=args.latest_stamps,
             metadata_json=args.metadata_json,
             post_metadata_txt=args.post_metadata_txt,
+            max_workers=args.workers,
             no_resume=args.no_resume,
             progress=sink,
         )

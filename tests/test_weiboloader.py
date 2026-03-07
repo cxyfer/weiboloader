@@ -117,6 +117,23 @@ class TestDownloadMedia:
         assert mock_req.call_args.kwargs["allow_captcha"] is False
         assert mock_req.call_args.kwargs["retries"] == 2
 
+    def test_download_uses_media_bucket_rate_controller(self, tmp_path: Path):
+        rate_controller = MagicMock()
+        ctx = WeiboLoaderContext(rate_controller=rate_controller)
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        dest = tmp_path / "paced.jpg"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.iter_content.return_value = [b"paced data"]
+
+        with patch.object(ctx.session, "request", return_value=mock_resp):
+            result = loader._download("http://example.com/img.jpg", dest)
+
+        assert result.outcome == MediaOutcome.DOWNLOADED
+        rate_controller.wait_before_request.assert_called_once_with("media")
+        rate_controller.handle_response.assert_called_once_with("media", 200)
+
     def test_part_file_rename(self, tmp_path: Path):
         ctx = MockContext()
         loader = WeiboLoader(ctx, output_dir=tmp_path)
@@ -348,6 +365,12 @@ def test_count_property(count):
     ctx = MockContext()
     loader = WeiboLoader(ctx, output_dir=Path("/tmp"), count=count)
     assert loader.count == max(0, count)
+
+
+def test_default_max_workers_is_one(tmp_path: Path):
+    ctx = MockContext()
+    loader = WeiboLoader(ctx, output_dir=tmp_path)
+    assert loader.max_workers == 1
 
 
 class TestDownloadTimeout:

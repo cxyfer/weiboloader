@@ -77,7 +77,7 @@ class WeiboLoader:
         latest_stamps: str | Path | None = None,
         metadata_json: bool = False,
         post_metadata_txt: str | None = None,
-        max_workers: int = 4,
+        max_workers: int = 1,
         no_resume: bool = False,
         checkpoint_dir: str | Path | None = None,
         output_dir: str | Path = ".",
