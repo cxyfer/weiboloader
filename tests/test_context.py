@@ -253,7 +253,7 @@ class TestResolveNickname:
             calls.append({"url": url, "allow_captcha": kwargs.get("allow_captcha", True)})
             mock_resp = MagicMock()
             if len(calls) == 1:
-                mock_resp.headers = {"Location": "https://visitor.passport.weibo.cn/visitor/visitor"}
+                mock_resp.headers = {"Location": ""}
                 mock_resp.url = url
                 mock_resp.status_code = 302
                 mock_resp.text = ""
@@ -270,6 +270,21 @@ class TestResolveNickname:
         assert uid == "111222333"
         assert len(calls) == 2
         assert all(c["allow_captcha"] is False for c in calls)
+
+    def test_resolve_passport_redirect_raises_auth_error(self):
+        """302 to passport URL should raise AuthError."""
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+
+        def fake_request(method, url, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.headers = {"Location": "https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282"}
+            mock_resp.url = url
+            mock_resp.status_code = 302
+            return mock_resp
+
+        with patch.object(ctx, "request", side_effect=fake_request):
+            with pytest.raises(AuthError, match="login required"):
+                ctx.resolve_nickname_to_uid("testuser")
 
 
 class TestGetUserInfo:
@@ -391,6 +406,64 @@ def test_cookie_roundtrip_property(cookies):
         if name and value:
             retrieved = ctx.session.cookies.get(name, domain=".weibo.cn")
             assert retrieved == value
+
+
+class TestExtractUid:
+    def test_passport_url_returns_none(self):
+        ctx = WeiboLoaderContext()
+        assert ctx._extract_uid("https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282") is None
+
+    def test_login_sina_url_returns_none(self):
+        ctx = WeiboLoaderContext()
+        assert ctx._extract_uid("https://login.sina.com.cn/sso/login?_rand=12345678") is None
+
+    def test_valid_u_path_returns_uid(self):
+        ctx = WeiboLoaderContext()
+        assert ctx._extract_uid("https://m.weibo.cn/u/3908122917") == "3908122917"
+
+    def test_valid_uid_query_returns_uid(self):
+        ctx = WeiboLoaderContext()
+        assert ctx._extract_uid("https://m.weibo.cn/api?uid=12345") == "12345"
+
+    def test_profile_path_returns_uid(self):
+        ctx = WeiboLoaderContext()
+        assert ctx._extract_uid("https://m.weibo.cn/profile/9876543210") == "9876543210"
+
+
+class TestHandleResponse432:
+    @responses.activate
+    def test_432_retries_then_succeeds(self):
+        responses.get("https://m.weibo.cn/api/test", status=432)
+        responses.get("https://m.weibo.cn/api/test", json={"ok": 1})
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        resp = ctx.request("GET", "/api/test")
+        assert resp.status_code == 200
+
+    @responses.activate
+    def test_432_exhausted_retries_raises_rate_limit(self):
+        for _ in range(5):
+            responses.get("https://m.weibo.cn/api/test", status=432)
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with pytest.raises(RateLimitError, match="rate limited"):
+            ctx.request("GET", "/api/test")
+
+
+class TestLoadSessionUAProtection:
+    def test_load_session_preserves_default_ua(self, tmp_path: Path):
+        import json
+        session_file = tmp_path / "session_test.dat"
+        payload = {
+            "cookies": [{"name": "SUB", "value": "v", "domain": ".weibo.cn", "path": "/"}],
+            "headers": {"User-Agent": "Evil/1.0", "X-Custom": "keep"},
+        }
+        session_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        ctx = WeiboLoaderContext(session_path=tmp_path / "session.dat")
+        default_ua = ctx.session.headers["User-Agent"]
+        ctx._load_session_file(session_file)
+
+        assert ctx.session.headers["User-Agent"] == default_ua
+        assert ctx.session.headers["X-Custom"] == "keep"
 
 
 class TestFetchVisitorCookies:

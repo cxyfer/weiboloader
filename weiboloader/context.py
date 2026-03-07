@@ -97,6 +97,12 @@ class WeiboLoaderContext:
             resp.close()
             raise AuthError("authentication failed")
 
+        if resp.status_code == 432:
+            resp.close()
+            if attempt < retries:
+                return None
+            raise RateLimitError(f"rate limited: {target}")
+
         if resp.status_code >= 500:
             resp.close()
             if attempt < retries:
@@ -257,7 +263,9 @@ class WeiboLoaderContext:
                         c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/")
                     )
             if isinstance(payload.get("headers"), dict):
-                self.session.headers.update(payload["headers"])
+                headers = payload["headers"]
+                headers.pop("User-Agent", None)
+                self.session.headers.update(headers)
             return True
         except Exception:
             return False
@@ -269,7 +277,10 @@ class WeiboLoaderContext:
         loc = resp.headers.get("Location", "")
         resp.close()
 
-        uid = self._extract_uid(loc or resp.url)
+        target_url = loc or resp.url
+        if any(kw in target_url.lower() for kw in ("passport.weibo", "visitor.weibo", "login.sina")):
+            raise AuthError("nickname resolve blocked by verification; login required")
+        uid = self._extract_uid(target_url)
         if uid:
             return uid
 
@@ -403,6 +414,8 @@ class WeiboLoaderContext:
         for pat in (r"/u/(\d{5,})", r"/profile/(\d{5,})"):
             if m := re.search(pat, parsed.path):
                 return m.group(1)
+        if any(kw in decoded.lower() for kw in ("passport.weibo", "visitor.weibo", "login.sina")):
+            return None
         if m := re.search(r"\d{5,}", decoded):
             return m.group(0)
         return None
