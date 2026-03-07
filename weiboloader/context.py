@@ -273,7 +273,7 @@ class WeiboLoaderContext:
         if uid:
             return uid
 
-        resp = self.request("GET", f"/n/{name}", retries=2)
+        resp = self.request("GET", f"/n/{name}", allow_captcha=False, retries=2)
         uid = self._extract_uid(resp.url) or self._extract_uid(resp.text)
         resp.close()
         if uid:

@@ -84,9 +84,11 @@ def is_playwright_available() -> bool:
 
 def _is_captcha_url(url: str) -> bool:
     parts = urlparse(url)
-    if parts.netloc == "passport.weibo.com" and parts.path.startswith("/visitor/"):
+    netloc = parts.netloc.lower()
+    path = parts.path.lower()
+    if "passport.weibo" in netloc and path.startswith("/visitor/"):
         return False
-    text = f"{parts.netloc}{parts.path}".lower()
+    text = f"{netloc}{path}"
     return any(h in text for h in ("passport.weibo", "login.sina", "verify", "captcha", "challenge"))
 
 
