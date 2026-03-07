@@ -271,13 +271,20 @@ class TestResolveNickname:
         assert len(calls) == 2
         assert all(c["allow_captcha"] is False for c in calls)
 
-    def test_resolve_passport_redirect_raises_auth_error(self):
-        """302 to passport URL should raise AuthError."""
+    @pytest.mark.parametrize(
+        "redirect_url",
+        [
+            "https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282",
+            "https://visitor.weibo.cn/2/welcome?foo=12345678",
+            "https://login.sina.com.cn/sso/login?_rand=12345678",
+        ],
+    )
+    def test_resolve_verification_redirect_raises_auth_error(self, redirect_url):
         ctx = WeiboLoaderContext(rate_controller=MockRateController())
 
         def fake_request(method, url, **kwargs):
             mock_resp = MagicMock()
-            mock_resp.headers = {"Location": "https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282"}
+            mock_resp.headers = {"Location": redirect_url}
             mock_resp.url = url
             mock_resp.status_code = 302
             return mock_resp
@@ -409,28 +416,49 @@ def test_cookie_roundtrip_property(cookies):
 
 
 class TestExtractUid:
-    def test_passport_url_returns_none(self):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282",
+            "https://visitor.weibo.cn/2/welcome?foo=12345678",
+            "https://login.sina.com.cn/sso/login?_rand=12345678",
+        ],
+    )
+    def test_verification_urls_return_none(self, url):
         ctx = WeiboLoaderContext()
-        assert ctx._extract_uid("https://visitor.passport.weibo.cn/visitor/visitor?_rand=1772848282") is None
+        assert ctx._extract_uid(url) is None
 
-    def test_login_sina_url_returns_none(self):
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://m.weibo.cn/u/3908122917", "3908122917"),
+            ("https://m.weibo.cn/api?uid=12345", "12345"),
+            ("https://m.weibo.cn/profile/9876543210", "9876543210"),
+        ],
+    )
+    def test_valid_urls_return_uid(self, url, expected):
         ctx = WeiboLoaderContext()
-        assert ctx._extract_uid("https://login.sina.com.cn/sso/login?_rand=12345678") is None
-
-    def test_valid_u_path_returns_uid(self):
-        ctx = WeiboLoaderContext()
-        assert ctx._extract_uid("https://m.weibo.cn/u/3908122917") == "3908122917"
-
-    def test_valid_uid_query_returns_uid(self):
-        ctx = WeiboLoaderContext()
-        assert ctx._extract_uid("https://m.weibo.cn/api?uid=12345") == "12345"
-
-    def test_profile_path_returns_uid(self):
-        ctx = WeiboLoaderContext()
-        assert ctx._extract_uid("https://m.weibo.cn/profile/9876543210") == "9876543210"
+        assert ctx._extract_uid(url) == expected
 
 
 class TestHandleResponse432:
+    def test_432_returns_none_when_retry_remains(self):
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        resp = requests.Response()
+        resp.status_code = 432
+        resp.url = "https://m.weibo.cn/api/test"
+        resp.raw = MagicMock()
+
+        result = ctx._handle_response(
+            resp,
+            "https://m.weibo.cn/api/test",
+            allow_captcha=False,
+            attempt=0,
+            retries=1,
+        )
+
+        assert result is None
+
     @responses.activate
     def test_432_retries_then_succeeds(self):
         responses.get("https://m.weibo.cn/api/test", status=432)
