@@ -379,9 +379,21 @@ class WeiboLoaderContext:
             resp.close()
 
     def _get_index(self, params: dict[str, Any]) -> dict[str, Any]:
-        payload = self._get_json("/api/container/getIndex", params=params)
-        if isinstance(data := payload.get("data"), dict):
-            return data
+        _CAPTCHA_URL = "https://m.weibo.cn/captcha/show?backUrl=https%3A%2F%2Fm.weibo.cn%2F"
+        _MAX_CAPTCHA_ATTEMPTS = 2
+
+        for attempt in range(_MAX_CAPTCHA_ATTEMPTS + 1):
+            payload = self._get_json("/api/container/getIndex", params=params)
+            if isinstance(data := payload.get("data"), dict):
+                return data
+
+            if self.captcha_mode == "skip":
+                raise RateLimitError(payload.get("msg") or "rate limited (captcha)")
+            if attempt < _MAX_CAPTCHA_ATTEMPTS:
+                if self._solve_captcha(_CAPTCHA_URL):
+                    continue
+                raise AuthError("captcha not solved")
+
         raise TargetError(payload.get("msg") or "api error")
 
     def _parse_posts(self, data: dict[str, Any]) -> list[Post]:

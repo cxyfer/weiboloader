@@ -488,3 +488,66 @@ class TestFetchVisitorCookies:
             MockFetcher.return_value.fetch.side_effect = ImportError("no playwright")
             with pytest.raises(ImportError):
                 ctx.fetch_visitor_cookies()
+
+
+class TestGetIndexCaptcha:
+    @responses.activate
+    def test_ok0_solve_captcha_then_retry_success(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "need captcha"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+        mock_solve.assert_called_once()
+
+    @responses.activate
+    def test_skip_mode_raises_rate_limit(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "rate limited"},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController(), captcha_mode="skip")
+        with pytest.raises(RateLimitError, match="rate limited"):
+            ctx._get_index({"type": "uid", "value": "123"})
+
+    @responses.activate
+    def test_solve_captcha_fails_raises_auth_error(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "captcha"},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=False):
+            with pytest.raises(AuthError, match="captcha not solved"):
+                ctx._get_index({"type": "uid", "value": "123"})
+
+    @responses.activate
+    def test_max_attempts_exhausted_raises_target_error(self):
+        for _ in range(3):
+            responses.get(
+                "https://m.weibo.cn/api/container/getIndex",
+                json={"ok": 0, "msg": "still blocked"},
+            )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            with pytest.raises(TargetError, match="still blocked"):
+                ctx._get_index({"type": "uid", "value": "123"})
+        assert mock_solve.call_count == 2
+
+    @responses.activate
+    def test_ok1_no_data_dict_raises_target_error(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": "not a dict"},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            with pytest.raises(TargetError):
+                ctx._get_index({"type": "uid", "value": "123"})
