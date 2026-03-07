@@ -232,3 +232,6 @@ references/
 
 # Checkpoints
 .checkpoints/
+
+# Cookies
+cookies.txt
