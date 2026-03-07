@@ -82,9 +82,19 @@ weiboloader --sessionfile session.dat --cookie "SUB=xxx" 1234567890
 weiboloader --visitor-cookies 1234567890
 ```
 
+- `--load-cookies` supports `chrome`, `firefox`, and `edge` (`pip install ".[browser]"`).
+- `--visitor-cookies` requires `pip install ".[captcha]"` and `playwright install chromium`.
+- `--sessionfile FILE` lets you persist and reuse an authenticated session.
+
 ### Options
 
 ```
+-mid, --mid MID          Download a single post by MID
+--load-cookies BROWSER   Import cookies from chrome|firefox|edge
+--cookie TEXT            Set cookies from a raw cookie string
+--cookie-file FILE       Load cookies from a cookie file
+--sessionfile FILE       Persist and reuse an authenticated session
+--visitor-cookies        Auto-fetch visitor cookies via Playwright
 --no-videos              Skip video downloads
 --no-pictures            Skip picture downloads
 --metadata-json          Save post metadata as JSON
