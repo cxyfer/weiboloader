@@ -4,10 +4,9 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
 import time
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,8 +15,9 @@ from urllib.parse import urlparse
 from .context import WeiboLoaderContext
 from .exceptions import CheckpointError, TargetError
 from .naming import build_directory, build_filename
-from .nodeiterator import CheckpointManager, NodeIterator
-from .structures import MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, TargetSpec, UserTarget
+from .nodeiterator import NodeIterator
+from .progress import CoverageInterval, ProgressStore
+from .structures import CursorState, MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, TargetSpec, UserTarget
 from .ui import DownloadResult, EventKind, MediaOutcome, NullSink, ProgressSink, UIEvent
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,13 @@ class _ResolvedTarget:
     target: TargetSpec
     key: str
     dir_kwargs: dict[str, str]
+
+
+@dataclass(slots=True)
+class _ActiveProgress:
+    target_key: str
+    resume: CursorState | None
+    coverage: list[CoverageInterval]
 
 
 class _PostIterator(NodeIterator):
@@ -74,11 +81,11 @@ class WeiboLoader:
         no_pictures: bool = False,
         count: int = 0,
         fast_update: bool = False,
-        latest_stamps: str | Path | None = None,
         metadata_json: bool = False,
         post_metadata_txt: str | None = None,
         max_workers: int = 1,
         no_resume: bool = False,
+        no_coverage: bool = False,
         checkpoint_dir: str | Path | None = None,
         output_dir: str | Path = ".",
         progress: ProgressSink | None = None,
@@ -95,19 +102,15 @@ class WeiboLoader:
         self.post_metadata_txt = post_metadata_txt
         self.max_workers = max(1, max_workers)
         self.no_resume = no_resume
+        self.no_coverage = no_coverage
         self.output_dir = Path(output_dir).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._options_hash = self._hash_options()
-        self._checkpoint = CheckpointManager(
-            Path(checkpoint_dir).expanduser() if checkpoint_dir else self.output_dir / ".checkpoints",
-            self._options_hash,
-        )
+        progress_dir = Path(checkpoint_dir).expanduser() if checkpoint_dir else self.output_dir / ".progress"
+        self._progress = ProgressStore(progress_dir)
+        self._active_progress: dict[str, _ActiveProgress] = {}
 
-        self._stamps_path = Path(latest_stamps).expanduser() if latest_stamps else None
-        self._stamps = self._load_stamps()
-        self._saved_stamps = self._serialize_stamps()
-        self._active_iters: dict[str, NodeIterator] = {}
 
     def _safe_emit(self, event: UIEvent) -> None:
         try:
@@ -127,7 +130,6 @@ class WeiboLoader:
             except Exception:
                 logger.exception("target failed: %s", key)
                 results[key] = False
-        self._save_stamps()
         return results
 
     def download_target(self, target: TargetSpec) -> bool:
@@ -138,19 +140,30 @@ class WeiboLoader:
             logger.exception("resolve failed: %s", key)
             return False
 
-        ck_key = self._ck_key(resolved.key)
         iterator = self._create_iterator(resolved.target)
-        self._active_iters[ck_key] = iterator
+        state = self._load_progress(resolved.key)
+        resume = None
+        coverage = list(state.coverage) if state else []
+        if not self.no_resume and state and state.resume and state.resume.options_hash == self._options_hash:
+            iterator.thaw(state.resume)
+            resume = state.resume
+
+        active = _ActiveProgress(target_key=resolved.key, resume=resume, coverage=coverage)
+        self._active_progress[resolved.key] = active
 
         target_dir = self._build_dir(resolved)
-        cutoff = self._stamps.get(resolved.key)
 
         processed = 0
-        newest: datetime | None = None
         ok = True
         downloaded = 0
         skipped = 0
         failed = 0
+        current_group_stamp: datetime | None = None
+        current_group_ok = True
+        safe_resume: CursorState | None = active.resume
+        group_entry_resume: CursorState | None = active.resume
+        group_resume: CursorState | None = active.resume
+        target_complete = True
 
         self._safe_emit(UIEvent(kind=EventKind.TARGET_START, target_key=resolved.key))
 
@@ -160,14 +173,30 @@ class WeiboLoader:
             exe = ThreadPoolExecutor(max_workers=self.max_workers)
             for post in iterator:
                 if self.count and processed >= self.count:
+                    target_complete = False
                     break
 
                 created = self._cst(post.created_at)
-                if cutoff and created <= cutoff:
-                    break
+                if current_group_stamp is not None and created != current_group_stamp:
+                    self._finalize_group(active, current_group_stamp, current_group_ok)
+                    if current_group_ok:
+                        safe_resume = group_resume
+                    active.resume = safe_resume
+                    current_group_stamp = None
+                    current_group_ok = True
+
+                if not self.no_coverage and ProgressStore.contains(active.coverage, created):
+                    continue
+
+                if current_group_stamp is None:
+                    current_group_stamp = created
+                    current_group_ok = True
+                    group_entry_resume = safe_resume
+                    group_resume = safe_resume
 
                 jobs = self._media_jobs(target_dir, post)
                 if self.fast_update and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
+                    target_complete = False
                     break
 
                 if self.metadata_json:
@@ -179,6 +208,7 @@ class WeiboLoader:
                 media_done = 0
                 post_index = processed + 1
                 timed_out = False
+                post_ok = True
 
                 future_to_path = {exe.submit(self._download, m.url, p): p for m, p in jobs}
                 post_timeout = max(60, media_total * _PER_MEDIA_TIMEOUT) if future_to_path else None
@@ -196,11 +226,15 @@ class WeiboLoader:
                             except Exception:
                                 failed += 1
                                 ok = False
+                                post_ok = False
                                 media_done += 1
                                 self._safe_emit(UIEvent(
-                                    kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
-                                    media_done=media_done, media_total=media_total,
-                                    post_index=post_index, filename=future_to_path[f].name,
+                                    kind=EventKind.MEDIA_DONE,
+                                    outcome=MediaOutcome.FAILED,
+                                    media_done=media_done,
+                                    media_total=media_total,
+                                    post_index=post_index,
+                                    filename=future_to_path[f].name,
                                 ))
                                 continue
                             if result.outcome == MediaOutcome.DOWNLOADED:
@@ -210,42 +244,63 @@ class WeiboLoader:
                             else:
                                 failed += 1
                                 ok = False
+                                post_ok = False
                             media_done += 1
                             self._safe_emit(UIEvent(
-                                kind=EventKind.MEDIA_DONE, outcome=result.outcome,
-                                media_done=media_done, media_total=media_total,
-                                post_index=post_index, filename=future_to_path[f].name,
+                                kind=EventKind.MEDIA_DONE,
+                                outcome=result.outcome,
+                                media_done=media_done,
+                                media_total=media_total,
+                                post_index=post_index,
+                                filename=future_to_path[f].name,
                             ))
                         if pending and time.monotonic() >= deadline:
                             timed_out = True
+                            post_ok = False
                             for f in pending:
                                 f.cancel()
                                 failed += 1
                                 ok = False
                                 media_done += 1
                                 self._safe_emit(UIEvent(
-                                    kind=EventKind.MEDIA_DONE, outcome=MediaOutcome.FAILED,
-                                    media_done=media_done, media_total=media_total,
-                                    post_index=post_index, filename=future_to_path[f].name,
+                                    kind=EventKind.MEDIA_DONE,
+                                    outcome=MediaOutcome.FAILED,
+                                    media_done=media_done,
+                                    media_total=media_total,
+                                    post_index=post_index,
+                                    filename=future_to_path[f].name,
                                 ))
                             break
 
                 processed += 1
-                if not timed_out and (newest is None or created > newest):
-                    newest = created
+                if not post_ok:
+                    current_group_ok = False
+                    group_resume = group_entry_resume
                 if not timed_out:
-                    self._save_ck(ck_key, iterator)
+                    frozen = iterator.freeze()
+                    if not self.no_resume:
+                        if post_ok:
+                            group_resume = frozen
+                        active.resume = group_resume
+                    self._persist_progress(active)
                 self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
-            if newest and (cutoff is None or newest > cutoff):
-                self._stamps[resolved.key] = newest
-            self._clear_ck(ck_key)
-            self._save_stamps()
+            if target_complete:
+                self._finalize_group(active, current_group_stamp, current_group_ok)
+                safe_resume = group_resume if current_group_ok else group_entry_resume
+            active.resume = safe_resume
+            if ok and target_complete:
+                active.resume = None
+            self._persist_progress(active)
 
             self._safe_emit(UIEvent(
-                kind=EventKind.TARGET_DONE, target_key=resolved.key,
-                posts_processed=processed, downloaded=downloaded,
-                skipped=skipped, failed=failed, ok=ok,
+                kind=EventKind.TARGET_DONE,
+                target_key=resolved.key,
+                posts_processed=processed,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                ok=ok,
             ))
             return ok
 
@@ -255,49 +310,52 @@ class WeiboLoader:
                 shutdown_done = True
             self._safe_emit(UIEvent(kind=EventKind.INTERRUPTED, target_key=resolved.key))
             self._safe_emit(UIEvent(
-                kind=EventKind.TARGET_DONE, target_key=resolved.key,
-                posts_processed=processed, downloaded=downloaded,
-                skipped=skipped, failed=failed, ok=False,
+                kind=EventKind.TARGET_DONE,
+                target_key=resolved.key,
+                posts_processed=processed,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                ok=False,
             ))
-            self._handle_interrupt(ck_key, iterator, newest, cutoff)
+            self._persist_progress(active)
             raise
         except Exception:
             logger.exception("download failed: %s", resolved.key)
             self._safe_emit(UIEvent(
-                kind=EventKind.TARGET_DONE, target_key=resolved.key,
-                posts_processed=processed, downloaded=downloaded,
-                skipped=skipped, failed=failed, ok=False,
+                kind=EventKind.TARGET_DONE,
+                target_key=resolved.key,
+                posts_processed=processed,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                ok=False,
             ))
-            self._handle_error(ck_key, iterator, newest, cutoff)
+            self._persist_progress(active)
             return False
         finally:
             if exe is not None and not shutdown_done:
                 exe.shutdown(wait=True)
                 shutdown_done = True
-            self._active_iters.pop(ck_key, None)
+            self._active_progress.pop(resolved.key, None)
 
     def _create_iterator(self, target: TargetSpec) -> _PostIterator:
         if isinstance(target, UserTarget):
             uid = target.identifier if target.is_uid else self.context.resolve_nickname_to_uid(target.identifier)
-            it = _PostIterator(lambda p: self.context.get_user_posts(uid, p), self._options_hash)
-        elif isinstance(target, SuperTopicTarget):
+            return _PostIterator(lambda p: self.context.get_user_posts(uid, p), self._options_hash)
+        if isinstance(target, SuperTopicTarget):
             cid = target.identifier
             if not target.is_containerid:
                 topics = self.context.search_supertopic(target.identifier)
                 if not topics:
                     raise TargetError(f"supertopic not found: {target.identifier}")
                 cid = topics[0].containerid
-            it = _PostIterator(lambda p: self.context.get_supertopic_posts(cid, p), self._options_hash)
-        elif isinstance(target, SearchTarget):
-            it = _PostIterator(lambda p: self.context.search_posts(target.keyword, p), self._options_hash)
-        elif isinstance(target, MidTarget):
-            it = _PostIterator(lambda _: ([self.context.get_post_by_mid(target.mid)], None), self._options_hash, single=True)
-        else:
-            raise TargetError(f"unsupported target: {target}")
-
-        if (state := self._load_ck(self._ck_key(self._target_key(target)))):
-            it.thaw(state)
-        return it
+            return _PostIterator(lambda p: self.context.get_supertopic_posts(cid, p), self._options_hash)
+        if isinstance(target, SearchTarget):
+            return _PostIterator(lambda p: self.context.search_posts(target.keyword, p), self._options_hash)
+        if isinstance(target, MidTarget):
+            return _PostIterator(lambda _: ([self.context.get_post_by_mid(target.mid)], None), self._options_hash, single=True)
+        raise TargetError(f"unsupported target: {target}")
 
     def _download(self, url: str, dest: Path) -> DownloadResult:
         if dest.exists() and dest.stat().st_size > 0:
@@ -308,7 +366,12 @@ class WeiboLoader:
         deadline = time.monotonic() + _MEDIA_DOWNLOAD_TIMEOUT
         try:
             resp = self.context.request(
-                "GET", url, bucket="media", allow_captcha=False, stream=True, retries=2,
+                "GET",
+                url,
+                bucket="media",
+                allow_captcha=False,
+                stream=True,
+                retries=2,
                 timeout=(self.context.req_timeout, _STREAM_READ_TIMEOUT),
             )
             sock = _get_socket(resp)
@@ -339,9 +402,8 @@ class WeiboLoader:
                 resp.close()
 
     def flush(self) -> None:
-        for key, it in list(self._active_iters.items()):
-            self._save_ck(key, it)
-        self._save_stamps()
+        for active in list(self._active_progress.values()):
+            self._persist_progress(active)
 
     def _resolve_target(self, target: TargetSpec) -> _ResolvedTarget:
         self._safe_emit(UIEvent(kind=EventKind.STAGE, message=f"Resolving {self._target_key(target)}"))
@@ -443,69 +505,27 @@ class WeiboLoader:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
-    def _load_stamps(self) -> dict[str, datetime]:
-        if not self._stamps_path or not self._stamps_path.exists():
-            return {}
+    def _load_progress(self, target_key: str):
         try:
-            data = json.loads(self._stamps_path.read_text(encoding="utf-8"))
-            return {k: datetime.fromisoformat(v) for k, v in data.items() if isinstance(v, str)}
+            return self._progress.load(target_key)
         except Exception:
-            return {}
+            return None
 
-    def _save_stamps(self) -> None:
-        if not self._stamps_path:
-            return
-        payload = self._serialize_stamps()
-        if payload == self._saved_stamps:
-            return
-        self._stamps_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self._stamps_path.parent, suffix=".tmp")
+    def _persist_progress(self, active: _ActiveProgress) -> None:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._stamps_path)
-            self._saved_stamps = payload
-        finally:
-            Path(tmp).unlink(missing_ok=True)
-
-    def _serialize_stamps(self) -> str:
-        return json.dumps({k: self._cst(v).isoformat() for k, v in sorted(self._stamps.items())}, ensure_ascii=False, indent=2)
-
-    def _save_ck(self, key: str, it: NodeIterator) -> None:
-        if self.no_resume:
-            return
-        try:
-            with self._checkpoint.acquire_lock(key):
-                self._checkpoint.save(key, it.freeze())
+            with self._progress.acquire_lock(active.target_key):
+                self._progress.save(
+                    active.target_key,
+                    resume=None if self.no_resume else active.resume,
+                    coverage=active.coverage,
+                )
         except RuntimeError as e:
             raise CheckpointError(str(e)) from e
 
-    def _load_ck(self, key: str):
-        if self.no_resume:
-            return None
-        try:
-            return self._checkpoint.load(key)
-        except Exception:
-            return None
-
-    def _clear_ck(self, key: str) -> None:
-        if self.no_resume:
+    def _finalize_group(self, active: _ActiveProgress, stamp: datetime | None, ok: bool) -> None:
+        if stamp is None or not ok or self.no_coverage:
             return
-        (self._checkpoint.dir / f"{key}.json").unlink(missing_ok=True)
-
-    def _handle_interrupt(self, key: str, it: NodeIterator, newest: datetime | None, cutoff: datetime | None):
-        self._save_ck(key, it)
-        if newest and (cutoff is None or newest > cutoff):
-            self._stamps[key] = newest
-        self._save_stamps()
-
-    def _handle_error(self, key: str, it: NodeIterator, newest: datetime | None, cutoff: datetime | None):
-        self._save_ck(key, it)
-        if newest and (cutoff is None or newest > cutoff):
-            self._stamps[key] = newest
-        self._save_stamps()
+        active.coverage = ProgressStore.normalize_intervals([*active.coverage, CoverageInterval(stamp, stamp)])
 
     @staticmethod
     def _target_key(target: TargetSpec) -> str:
@@ -518,9 +538,6 @@ class WeiboLoader:
         if isinstance(target, MidTarget):
             return f"m:{target.mid}"
         return str(target)
-
-    def _ck_key(self, target_key: str) -> str:
-        return hashlib.sha1(target_key.encode()).hexdigest()[:16]
 
     @staticmethod
     def _cst(dt: datetime) -> datetime:
