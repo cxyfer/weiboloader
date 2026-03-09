@@ -1,103 +1,31 @@
 from __future__ import annotations
 
-import json
-import logging
-import os
-import sys
-import tempfile
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
-from pathlib import Path
-from typing import TYPE_CHECKING
 
+from .progress import ProgressStore
 from .structures import CursorState, Post
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-_IS_WIN = sys.platform == "win32"
-
-logger = logging.getLogger(__name__)
-VERSION = "1"
 
 
 class CheckpointManager:
-    def __init__(self, checkpoint_dir: Path, options_hash: str = ""):
-        self.dir = Path(checkpoint_dir)
+    def __init__(self, checkpoint_dir, options_hash: str = ""):
+        self._store = ProgressStore(checkpoint_dir)
+        self.dir = self._store.dir
         self.options_hash = options_hash
-        self.dir.mkdir(parents=True, exist_ok=True)
 
-    def _paths(self, key: str) -> tuple[Path, Path]:
-        base = self.dir / key
-        return base.with_suffix(".json"), base.with_suffix(".lock")
-
-    @contextmanager
-    def acquire_lock(self, key: str) -> Generator[None, None, None]:
-        _, lock_path = self._paths(key)
-        lock_path.touch(exist_ok=True)
-        with open(lock_path, "w") as f:
-            try:
-                if _IS_WIN:
-                    import msvcrt
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                yield
-            except (BlockingIOError, OSError):
-                raise RuntimeError(f"lock contention: {key}")
-            finally:
-                if _IS_WIN:
-                    import msvcrt
-                    try:
-                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
-                else:
-                    import fcntl
-                    fcntl.flock(f, fcntl.LOCK_UN)
+    def acquire_lock(self, key: str):
+        return self._store.acquire_lock(key)
 
     def load(self, key: str) -> CursorState | None:
-        path, _ = self._paths(key)
-        if not path.exists():
+        state = self._store.load(key)
+        if state is None or state.resume is None:
             return None
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("version") != VERSION or data.get("options_hash") != self.options_hash:
-                return None
-            return CursorState(
-                page=data["page"],
-                cursor=data.get("cursor"),
-                seen_mids=data.get("seen_mids", []),
-                options_hash=data.get("options_hash", ""),
-                timestamp=data.get("timestamp"),
-            )
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning("corrupt checkpoint %s: %s", key, e)
+        if state.resume.options_hash != self.options_hash:
             return None
+        return state.resume
 
     def save(self, key: str, state: CursorState) -> None:
-        path, _ = self._paths(key)
-        data = {
-            "version": VERSION,
-            "page": state.page,
-            "cursor": state.cursor,
-            "seen_mids": state.seen_mids,
-            "options_hash": state.options_hash,
-            "timestamp": state.timestamp,
-        }
-        fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except Exception as e:
-            logger.error("checkpoint save failed: %s", e)
-            Path(tmp).unlink(missing_ok=True)
+        self._store.save(key, resume=state)
 
 
 class NodeIterator(Iterator[Post]):

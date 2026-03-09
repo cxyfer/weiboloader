@@ -1,20 +1,31 @@
-"""Tests for NodeIterator and CheckpointManager (Phase 2.4)."""
+"""Tests for NodeIterator and ProgressStore."""
 from __future__ import annotations
 
 import json
-import threading
-import time
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 from hypothesis import given, strategies as st
 
-from weiboloader.nodeiterator import CheckpointManager, NodeIterator
-from weiboloader.structures import CursorState, Post, User
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "weiboloader"
+if "weiboloader" not in sys.modules:
+    package = types.ModuleType("weiboloader")
+    package.__path__ = [str(_PACKAGE_ROOT)]
+    sys.modules["weiboloader"] = package
 
-if TYPE_CHECKING:
-    from collections.abc import Generator
+NodeIterator = import_module("weiboloader.nodeiterator").NodeIterator
+progress_module = import_module("weiboloader.progress")
+structures_module = import_module("weiboloader.structures")
+CoverageInterval = progress_module.CoverageInterval
+ProgressStore = progress_module.ProgressStore
+CursorState = structures_module.CursorState
+Post = structures_module.Post
+
+UTC = timezone.utc
 
 
 class MockIterator(NodeIterator):
@@ -37,76 +48,156 @@ def make_post(mid: str, text: str = "") -> Post:
         mid=mid,
         bid=None,
         text=text,
-        created_at=__import__("datetime").datetime.now(),
+        created_at=datetime.now(),
         user=None,
         media_items=[],
         raw={"mid": mid},
     )
 
 
-class TestCheckpointManager:
+def make_resume_state(page: int = 5, options_hash: str = "abc123") -> CursorState:
+    return CursorState(
+        page=page,
+        cursor=f"c{page}",
+        seen_mids=[f"m{i}" for i in range(1, 3)],
+        options_hash=options_hash,
+        timestamp="2024-01-01T00:00:00+00:00",
+    )
+
+
+class TestProgressStore:
     def test_load_nonexistent_returns_none(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-        assert mgr.load("nonexistent") is None
+        store = ProgressStore(tmp_path / ".progress")
+        assert store.load("u:nonexistent") is None
 
     def test_save_and_load_roundtrip(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path, options_hash="abc123")
-        state = CursorState(page=5, cursor="c123", seen_mids=["m1", "m2"], options_hash="abc123", timestamp="2024-01-01T00:00:00")
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target1"
+        resume = make_resume_state()
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        intervals = [
+            (start + timedelta(hours=2), start + timedelta(hours=3)),
+            (start, start + timedelta(hours=1)),
+            (start + timedelta(minutes=30), start + timedelta(hours=2, minutes=30)),
+        ]
 
-        mgr.save("target1", state)
-        loaded = mgr.load("target1")
+        store.save(target_key, resume=resume, coverage=intervals)
+        loaded = store.load(target_key)
 
         assert loaded is not None
-        assert loaded.page == 5
-        assert loaded.cursor == "c123"
-        assert loaded.seen_mids == ["m1", "m2"]
-        assert loaded.options_hash == "abc123"
+        assert loaded.target_key == target_key
+        assert loaded.resume == resume
+        assert loaded.coverage == [CoverageInterval(start=start, end=start + timedelta(hours=3))]
 
-    def test_version_mismatch_returns_none(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-        path = tmp_path / "target.json"
-        path.write_text(json.dumps({"version": "0", "page": 1, "options_hash": ""}))
-        assert mgr.load("target") is None
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["target_key"] == target_key
+        assert payload["resume"]["page"] == resume.page
+        assert payload["coverage"]["intervals"] == [
+            {
+                "start": start.isoformat(),
+                "end": (start + timedelta(hours=3)).isoformat(),
+            }
+        ]
 
-    def test_options_hash_mismatch_returns_none(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path, options_hash="new")
-        path = tmp_path / "target.json"
-        path.write_text(json.dumps({"version": "1", "page": 1, "options_hash": "old", "seen_mids": []}))
-        assert mgr.load("target") is None
+    def test_resume_can_be_absent(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target1"
 
-    def test_corrupt_checkpoint_logs_warning(self, tmp_path: Path, caplog):
-        mgr = CheckpointManager(tmp_path)
-        path = tmp_path / "target.json"
-        path.write_text("not valid json")
+        store.save(target_key, coverage=[])
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        assert loaded.resume is None
+        assert loaded.coverage == []
+
+    def test_corrupt_progress_logs_warning(self, tmp_path: Path, caplog):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text("not valid json", encoding="utf-8")
 
         with caplog.at_level("WARNING"):
-            result = mgr.load("target")
+            result = store.load(target_key)
 
         assert result is None
-        assert "corrupt checkpoint" in caplog.text.lower()
+        assert "corrupt progress" in caplog.text.lower()
 
-    def test_atomic_write(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-        state = CursorState(page=1, cursor=None, seen_mids=[], options_hash="", timestamp=None)
+    def test_target_key_mismatch_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(json.dumps({"version": "1", "target_key": "u:other"}), encoding="utf-8")
 
-        mgr.save("target", state)
+        assert store.load(target_key) is None
 
-        tmp_files = list(tmp_path.glob("*.tmp"))
-        assert len(tmp_files) == 0
+    def test_atomic_write_leaves_no_tmp_files(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        store.save("u:target", resume=make_resume_state(), coverage=[])
 
-    @pytest.mark.parametrize("page", [1, 10, 100])
-    def test_checkpoint_file_is_valid_json(self, tmp_path: Path, page: int):
-        """PBT: checkpoint file is always valid JSON or absent."""
-        mgr = CheckpointManager(tmp_path)
-        state = CursorState(page=page, cursor=f"c{page}", seen_mids=[f"m{i}" for i in range(page)], options_hash="", timestamp=None)
+        assert list(store.dir.glob("*.tmp")) == []
 
-        mgr.save("target", state)
-        path = tmp_path / "target.json"
+    def test_lock_contention_raises(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
 
-        assert path.exists()
-        data = json.loads(path.read_text())
-        assert "version" in data
-        assert "page" in data
+        with store.acquire_lock("u:target"):
+            with pytest.raises(RuntimeError, match="lock contention"):
+                with store.acquire_lock("u:target"):
+                    pass
+
+    def test_lock_release_allows_reacquire(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+
+        with store.acquire_lock("u:target"):
+            pass
+
+        with store.acquire_lock("u:target"):
+            pass
+
+    def test_different_keys_no_contention(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+
+        with store.acquire_lock("u:target1"):
+            with store.acquire_lock("u:target2"):
+                pass
+
+    def test_coverage_operations_keep_intervals_sorted_and_non_overlapping(self):
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        intervals = [
+            (start + timedelta(hours=4), start + timedelta(hours=5)),
+            (start + timedelta(hours=1), start + timedelta(hours=2)),
+            (start + timedelta(hours=2), start + timedelta(hours=3)),
+            (start, start + timedelta(minutes=30)),
+        ]
+
+        normalized = ProgressStore.normalize_intervals(intervals)
+
+        assert normalized == [
+            CoverageInterval(start=start, end=start + timedelta(minutes=30)),
+            CoverageInterval(start=start + timedelta(hours=1), end=start + timedelta(hours=3)),
+            CoverageInterval(start=start + timedelta(hours=4), end=start + timedelta(hours=5)),
+        ]
+        assert ProgressStore.contains(normalized, start + timedelta(hours=2, minutes=30)) is True
+        assert ProgressStore.contains(normalized, start + timedelta(hours=3, minutes=30)) is False
+
+    def test_coverage_requires_aware_timestamps(self):
+        start = datetime(2024, 1, 1)
+        end = start + timedelta(hours=1)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            ProgressStore.normalize_intervals([(start, end)])
+
+    def test_serialize_and_deserialize_intervals_roundtrip(self):
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        intervals = [
+            CoverageInterval(start=start, end=start + timedelta(hours=1)),
+            CoverageInterval(start=start + timedelta(hours=2), end=start + timedelta(hours=3)),
+        ]
+
+        serialized = ProgressStore.serialize_intervals(intervals)
+        deserialized = ProgressStore.deserialize_intervals(serialized)
+
+        assert deserialized == intervals
 
 
 class TestNodeIterator:
@@ -133,7 +224,6 @@ class TestNodeIterator:
         assert mids == ["m1", "m2", "m3", "m4"]
 
     def test_no_duplicate_mids(self):
-        """PBT: no mid is yielded twice."""
         posts1 = [make_post("m1"), make_post("m2")]
         posts2 = [make_post("m2"), make_post("m3")]
         it = MockIterator([posts1, posts2])
@@ -143,7 +233,6 @@ class TestNodeIterator:
         assert set(mids) == {"m1", "m2", "m3"}
 
     def test_freeze_thaw_roundtrip(self):
-        """PBT: thaw(freeze(state)).next() == state.next()."""
         posts1 = [make_post("m1")]
         posts2 = [make_post("m2"), make_post("m3")]
         it = MockIterator([posts1, posts2])
@@ -158,7 +247,6 @@ class TestNodeIterator:
         assert remaining == ["m2", "m3"]
 
     def test_freeze_idempotent(self):
-        """PBT: freeze without advancing -> identical serialized output."""
         it = MockIterator([[make_post("m1")]], options_hash="test")
         state1 = it.freeze()
         state2 = it.freeze()
@@ -169,7 +257,6 @@ class TestNodeIterator:
         assert state1.options_hash == state2.options_hash
 
     def test_cursor_monotonic_advances(self):
-        """PBT: cursor monotonically advances."""
         posts = [[make_post(f"m{i}")] for i in range(5)]
         it = MockIterator(posts)
 
@@ -186,37 +273,8 @@ class TestNodeIterator:
         assert len(set(cursors)) == len(cursors)
 
 
-class TestCheckpointManagerLock:
-    def test_lock_contention_raises(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-
-        with mgr.acquire_lock("target"):
-            with pytest.raises(RuntimeError, match="lock contention"):
-                with mgr.acquire_lock("target"):
-                    pass
-
-    def test_lock_release_allows_reacquire(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-
-        with mgr.acquire_lock("target"):
-            pass
-
-        with mgr.acquire_lock("target"):
-            pass
-
-    def test_different_keys_no_contention(self, tmp_path: Path):
-        mgr = CheckpointManager(tmp_path)
-
-        with mgr.acquire_lock("target1"):
-            with mgr.acquire_lock("target2"):
-                pass
-
-
 @given(st.integers(min_value=1, max_value=100))
 def test_checkpoint_roundtrip_property(page):
-    """PBT: thaw(freeze(state)) preserves page number."""
-    from datetime import datetime
-
     state = CursorState(
         page=page,
         cursor=f"cursor_{page}",
