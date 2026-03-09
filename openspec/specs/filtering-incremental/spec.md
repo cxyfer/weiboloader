@@ -26,26 +26,34 @@ When `--fast-update` is enabled, the system SHALL stop fetching posts for a targ
 - **WHEN** `--fast-update` is enabled but no files exist on disk
 - **THEN** system SHALL process all posts (behaves like normal mode)
 
-### Requirement: Latest stamps for incremental updates
-The system SHALL support `--latest-stamps <path>` to record the timestamp of the most recent post downloaded per target. On subsequent runs, only posts newer than the recorded stamp SHALL be downloaded.
+### Requirement: Coverage-based incremental updates
+The system SHALL persist per-target coverage in `output_dir/.progress` and use it to skip already confirmed timestamp groups on subsequent runs.
 
-#### Scenario: First run with latest-stamps
-- **WHEN** `--latest-stamps stamps.json` is used and the file does not exist
-- **THEN** system SHALL download all posts and create `stamps.json` with each target's latest post timestamp
+#### Scenario: First run creates coverage
+- **WHEN** unified progress for a target does not exist
+- **THEN** system SHALL download all posts and persist confirmed coverage for completed timestamp groups
 
-#### Scenario: Incremental run with latest-stamps
-- **WHEN** `--latest-stamps stamps.json` is used and the file records target A's last stamp as `2025-06-01T12:00:00+08:00`
-- **THEN** system SHALL only download posts from target A with timestamp > `2025-06-01T12:00:00+08:00`
+#### Scenario: Coverage hit skips post but keeps scanning
+- **WHEN** unified progress already covers timestamp `2025-06-01T12:00:00+08:00`
+- **THEN** system SHALL skip posts at that timestamp and continue scanning older posts for uncovered gaps
 
-#### Scenario: Stamps file round-trip
-- **WHEN** stamps file is saved and loaded
-- **THEN** the target→timestamp mapping MUST be semantically equivalent, with timestamps as aware CST (+0800)
+#### Scenario: Coverage advances only after full timestamp-group success
+- **WHEN** multiple posts share the same timestamp and all of them complete successfully
+- **THEN** system SHALL mark that timestamp group as covered
 
-#### Scenario: Idempotent incremental run
-- **WHEN** source data has not changed and `--latest-stamps` is used for a second run
-- **THEN** system SHALL download zero new posts and stamps file SHALL remain unchanged
+#### Scenario: Failed or timed-out posts do not advance coverage
+- **WHEN** a post in a timestamp group fails or times out
+- **THEN** system SHALL NOT advance coverage for that timestamp group
+
+#### Scenario: Idempotent incremental run with coverage
+- **WHEN** source data has not changed and prior coverage already spans all available timestamp groups
+- **THEN** system SHALL download zero new posts while preserving the stored coverage intervals
+
+#### Scenario: Coverage can be disabled explicitly
+- **WHEN** user passes `--no-coverage`
+- **THEN** system SHALL ignore stored coverage during filtering and SHALL NOT expand coverage during that run
 
 <!-- PBT: processed_count ≤ --count for all targets -->
 <!-- PBT: count=n result set ⊆ count=m result set (m > n) -->
-<!-- PBT: Load(Save(stamps)) == stamps (round-trip, aware CST) -->
-<!-- PBT: second run with unchanged source → 0 new downloads -->
+<!-- PBT: unchanged source with full coverage → 0 new downloads -->
+<!-- PBT: coverage only advances for fully successful timestamp groups -->

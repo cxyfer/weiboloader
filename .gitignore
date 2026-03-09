@@ -230,8 +230,8 @@ CLAUDE.md
 # Reference repos
 references/
 
-# Checkpoints
-.checkpoints/
+# Unified progress
+.progress/
 
 # Cookies
 cookies.txt

@@ -14,8 +14,8 @@
 
 - Download from multiple target types: user timeline, supertopic, search keyword, single post (MID/URL)
 - Customizable file/directory naming with template patterns
-- Incremental download with `--fast-update` and `--latest-stamps`
-- Resumable downloads with checkpoint support
+- Incremental download with automatic coverage tracking in `output_dir/.progress`
+- Resumable downloads with unified progress state (`resume` + `coverage`)
 - API sliding-window rate control (default: 60 requests / 600s) with exponential backoff
 - Captcha handling: auto (Playwright), browser-based, manual, or skip
 - Cookie authentication: browser import, string, file, session persistence
@@ -103,14 +103,24 @@ weiboloader --visitor-cookies 1234567890
 --filename-pattern PAT   File naming pattern (default: {date}_{name})
 --count N                Limit number of posts (0 = unlimited)
 --fast-update            Stop at first existing file
---latest-stamps FILE     Track latest download timestamps
---no-resume              Disable checkpoint resume
+--no-resume              Disable cursor resume from unified progress
+--no-coverage            Disable coverage-based incremental filtering
 --request-interval SEC   Minimum seconds between requests per bucket (default: 1)
 --api-rate-limit N       API sliding-window quota (default: 60)
 --api-rate-window SEC    API sliding-window window in seconds (default: 600)
 --workers N              Concurrent media download workers (default: 1)
 --captcha-mode MODE      auto|browser|manual|skip (default: auto)
 ```
+
+### Progress persistence
+
+- The loader stores per-target progress in `output_dir/.progress/` by default.
+- Unified progress contains two parts: `resume` for cursor recovery after interruption, and `coverage` for incremental filtering across completed timestamp groups.
+- A successful target completion clears `resume` and keeps `coverage`.
+- Interrupted or failed runs keep `resume` and only preserve confirmed `coverage`.
+- `--no-resume` disables cursor recovery but still allows coverage-based skipping.
+- `--no-coverage` disables coverage-based skipping but still allows resume state to be written.
+- Ctrl+C flushes the same unified progress state before exit.
 
 ### Request pacing
 
@@ -152,7 +162,7 @@ ctx = WeiboLoaderContext(
 )
 ctx.set_cookies_from_string("SUB=xxx")
 
-loader = WeiboLoader(ctx, count=10)
+loader = WeiboLoader(ctx, count=10, no_coverage=False)
 loader.download_target(UserTarget(identifier="1234567890", is_uid=True))
 ```
 

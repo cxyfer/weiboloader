@@ -1,33 +1,33 @@
 ## ADDED Requirements
 
-### Requirement: NodeIterator with freeze/thaw
-The system SHALL implement a `NodeIterator` that supports serializing its pagination state (cursor, seen post IDs, options hash) to a JSON checkpoint file, and restoring from it on subsequent runs.
+### Requirement: Unified progress store
+The system SHALL persist per-target unified progress in `output_dir/.progress`, combining iterator `resume` state and incremental `coverage` state in a single JSON record.
 
-#### Scenario: Freeze state mid-pagination
-- **WHEN** iterator has processed 3 pages and is interrupted
-- **THEN** system SHALL serialize the current cursor and seen mids to a checkpoint JSON file
+#### Scenario: Freeze resume state mid-pagination
+- **WHEN** iterator has processed part of a target and the current post does not time out
+- **THEN** system SHALL serialize the current cursor and seen mids into the target's unified progress record
 
-#### Scenario: Thaw and resume
-- **WHEN** system starts and a valid checkpoint file exists for the target
+#### Scenario: Thaw and resume when options are compatible
+- **WHEN** system starts and a valid unified progress record exists for the target with matching `options_hash`
 - **THEN** system SHALL restore iterator state and resume from the saved cursor, without re-fetching already-processed pages
 
-#### Scenario: Freeze/thaw round-trip
-- **WHEN** `thaw(freeze(iterator_state))` is applied
-- **THEN** the restored iterator MUST produce the same subsequent sequence as the original
+#### Scenario: Ignore incompatible resume state
+- **WHEN** unified progress contains `resume` with a different `options_hash`
+- **THEN** system SHALL ignore the stored `resume` state and start from the beginning for iteration
 
-#### Scenario: Corrupted checkpoint file
-- **WHEN** checkpoint file exists but contains invalid JSON
-- **THEN** system SHALL discard the checkpoint, log a warning, and start from the beginning
+#### Scenario: Corrupt unified progress file
+- **WHEN** unified progress file exists but contains invalid JSON
+- **THEN** system SHALL discard the file, log a warning, and start from the beginning
 
-### Requirement: Atomic checkpoint writes
-Checkpoint files MUST be written atomically using tmp-file + rename pattern to prevent corruption from crashes.
+### Requirement: Atomic unified progress writes
+Unified progress files MUST be written atomically using tmp-file + rename pattern to prevent corruption from crashes.
 
-#### Scenario: Crash during checkpoint write
+#### Scenario: Crash during unified progress write
 - **WHEN** process crashes between writing tmp file and renaming
-- **THEN** the previous valid checkpoint MUST remain intact (no partial writes)
+- **THEN** the previous valid unified progress file MUST remain intact (no partial writes)
 
 #### Scenario: Concurrent access prevention
-- **WHEN** two processes attempt to write checkpoints for the same target simultaneously
+- **WHEN** two processes attempt to write unified progress for the same target simultaneously
 - **THEN** system SHALL use a lock file to ensure mutual exclusion; the second process MUST fail-fast or wait
 
 ### Requirement: File existence skip
@@ -57,14 +57,14 @@ Media downloads MUST be written to a `.part` temporary file first, then renamed 
 - **THEN** the `.part` file SHALL remain on disk; the final filename SHALL NOT exist
 
 ### Requirement: Disable resume option
-The system SHALL support `--no-resume` to disable checkpoint-based resumption.
+The system SHALL support `--no-resume` to disable restoring iterator cursor state from unified progress.
 
 #### Scenario: No-resume flag
 - **WHEN** user passes `--no-resume`
-- **THEN** system SHALL ignore existing checkpoint files and start from the beginning
+- **THEN** system SHALL ignore existing `resume` state and start iteration from the beginning, while leaving stored `coverage` behavior unchanged
 
 <!-- PBT: thaw(freeze(state)).next() == state.next() (round-trip) -->
 <!-- PBT: freeze without advancing → identical serialized output (idempotent) -->
 <!-- PBT: cursor monotonically advances; no mid is yielded twice -->
-<!-- PBT: checkpoint file is always valid JSON or absent (atomic write) -->
+<!-- PBT: unified progress file is always valid JSON or absent (atomic write) -->
 <!-- PBT: exists && size>0 → skip; size==0 || !exists → download -->

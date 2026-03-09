@@ -69,7 +69,7 @@ The CLI SHALL return exit codes matching instaloader convention:
 
 #### Scenario: User interrupt exit code
 - **WHEN** user presses Ctrl+C during download
-- **THEN** system SHALL flush checkpoints/stamps and exit with code `5`
+- **THEN** system SHALL flush unified progress (`resume` + confirmed `coverage`) and exit with code `5`
 
 <!-- PBT: exit_code ∈ {0,1,2,3,5} for all possible argv combinations -->
 <!-- PBT: batch order permutation SHALL NOT change per-target success/failure classification -->
