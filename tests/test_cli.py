@@ -1,15 +1,48 @@
 """Tests for CLI (Phase 5.1)."""
 from __future__ import annotations
 
+import sys
+import types
+from importlib import import_module
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import given, strategies as st
 
-import weiboloader.__main__ as cli_main
-from weiboloader.__main__ import _extract_mid_from_url, _looks_like_containerid, parse_args, parse_target
-from weiboloader.exceptions import InitError
-from weiboloader.structures import MidTarget, SearchTarget, SuperTopicTarget, UserTarget
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "weiboloader"
+if "weiboloader" not in sys.modules:
+    package = types.ModuleType("weiboloader")
+    package.__path__ = [str(_PACKAGE_ROOT)]
+    sys.modules["weiboloader"] = package
+
+if "weiboloader.context" not in sys.modules:
+    context_module = types.ModuleType("weiboloader.context")
+
+    class WeiboLoaderContext: ...
+
+    context_module.WeiboLoaderContext = WeiboLoaderContext
+    sys.modules["weiboloader.context"] = context_module
+
+if "weiboloader.weiboloader" not in sys.modules:
+    loader_module = types.ModuleType("weiboloader.weiboloader")
+
+    class WeiboLoader: ...
+
+    loader_module.WeiboLoader = WeiboLoader
+    sys.modules["weiboloader.weiboloader"] = loader_module
+
+cli_main = import_module("weiboloader.__main__")
+_extract_mid_from_url = cli_main._extract_mid_from_url
+_looks_like_containerid = cli_main._looks_like_containerid
+parse_args = cli_main.parse_args
+parse_target = cli_main.parse_target
+InitError = import_module("weiboloader.exceptions").InitError
+structures_module = import_module("weiboloader.structures")
+MidTarget = structures_module.MidTarget
+SearchTarget = structures_module.SearchTarget
+SuperTopicTarget = structures_module.SuperTopicTarget
+UserTarget = structures_module.UserTarget
 
 
 class TestExtractMidFromUrl:
@@ -94,6 +127,8 @@ class TestParseArgs:
     def test_minimal_args(self):
         args = parse_args(["123456"])
         assert args.targets == ["123456"]
+        assert args.no_resume is False
+        assert args.no_coverage is False
 
     def test_mid_flag(self):
         args = parse_args(["-mid", "abc123"])
@@ -123,19 +158,19 @@ class TestParseArgs:
         args = parse_args([
             "--count", "100",
             "--fast-update",
-            "--latest-stamps", "/tmp/stamps.json",
             "--no-resume",
+            "--no-coverage",
             "--request-interval", "1.5",
             "--api-rate-limit", "42",
             "--api-rate-window", "123.5",
             "--workers", "7",
             "--captcha-mode", "skip",
-            "123"
+            "123",
         ])
         assert args.count == 100
         assert args.fast_update is True
-        assert args.latest_stamps == "/tmp/stamps.json"
         assert args.no_resume is True
+        assert args.no_coverage is True
         assert args.request_interval == 1.5
         assert args.api_rate_limit == 42
         assert args.api_rate_window == 123.5
@@ -148,6 +183,10 @@ class TestParseArgs:
         assert args.api_rate_limit == 60
         assert args.api_rate_window == 600
         assert args.workers == 1
+
+    def test_latest_stamps_is_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--latest-stamps", "/tmp/stamps.json", "123"])
 
     def test_negative_count_error(self):
         with pytest.raises(SystemExit):
@@ -179,7 +218,7 @@ class TestParseArgs:
 
 
 class TestMainRuntimeDefaults:
-    def test_main_passes_default_interval_and_workers(self):
+    def test_main_passes_default_interval_workers_and_coverage(self):
         fake_context = MagicMock()
         fake_context.load_session.return_value = False
 
@@ -196,12 +235,28 @@ class TestMainRuntimeDefaults:
         mock_rate.assert_called_once_with(api_limit=60, api_window=600, request_interval=1.0)
         assert mock_context_cls.call_args.kwargs["rate_controller"] is rate_controller
         assert mock_loader_cls.call_args.kwargs["max_workers"] == 1
+        assert mock_loader_cls.call_args.kwargs["no_coverage"] is False
+
+    def test_main_passes_no_coverage_flag(self):
+        fake_context = MagicMock()
+        fake_context.load_session.return_value = False
+
+        fake_loader = MagicMock()
+        fake_loader.download_targets.return_value = {"u:123456": True}
+
+        with patch.object(cli_main, "SlidingWindowRateController", return_value=object()):
+            with patch.object(cli_main, "WeiboLoaderContext", return_value=fake_context):
+                with patch.object(cli_main, "WeiboLoader", return_value=fake_loader) as mock_loader_cls:
+                    code = cli_main.main(["--no-coverage", "123456"])
+
+        assert code == 0
+        assert mock_loader_cls.call_args.kwargs["no_coverage"] is True
+        assert "latest_stamps" not in mock_loader_cls.call_args.kwargs
+
 
 class TestExitCodeProperty:
     @given(st.lists(st.text(min_size=1), min_size=1, max_size=5))
     def test_exit_code_property(self, targets):
-        """PBT: exit_code in {0,1,2,3,5} for all argv combinations."""
-        from weiboloader.__main__ import main
         from weiboloader.exceptions import map_exception_to_exit_code
 
         valid_codes = {0, 1, 2, 3, 5}

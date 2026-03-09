@@ -84,9 +84,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--post-filter")
     parser.add_argument("--count", type=int, default=0)
     parser.add_argument("--fast-update", action="store_true")
-    parser.add_argument("--latest-stamps")
 
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--no-coverage", action="store_true")
     parser.add_argument("--request-interval", type=float, default=1.0)
     parser.add_argument("--api-rate-limit", type=int, default=60)
     parser.add_argument("--api-rate-window", type=float, default=600)
@@ -186,11 +186,11 @@ def main(argv: list[str] | None = None) -> int:
             no_pictures=args.no_pictures,
             count=args.count,
             fast_update=args.fast_update,
-            latest_stamps=args.latest_stamps,
             metadata_json=args.metadata_json,
             post_metadata_txt=args.post_metadata_txt,
             max_workers=args.workers,
             no_resume=args.no_resume,
+            no_coverage=args.no_coverage,
             progress=sink,
         )
 
