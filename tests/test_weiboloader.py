@@ -871,14 +871,12 @@ class TestRunBasedCoverage:
 
         saved = load_progress_state(tmp_path, "u:test")
         assert saved is not None
-        assert len(saved.coverage) == 3
+        assert len(saved.coverage) == 2
         intervals_sorted = sorted(saved.coverage, key=lambda x: x.start)
         assert intervals_sorted[0].start == ts2
         assert intervals_sorted[0].end == ts1
         assert intervals_sorted[1].start == ts4
-        assert intervals_sorted[1].end == ts4
-        assert intervals_sorted[2].start == ts3
-        assert intervals_sorted[2].end == ts3
+        assert intervals_sorted[1].end == ts3
 
     def test_coverage_options_mismatch_does_not_skip(self, tmp_path: Path):
         ctx = MockContext()

@@ -564,12 +564,12 @@ class WeiboLoader:
         if len(active.monotonic_window) > 0 and stamp > active.monotonic_window[-1]:
             active.committed_coverage = ProgressStore.normalize_intervals([
                 *active.committed_coverage,
-                CoverageInterval(active.run_start, active.run_end),
-                CoverageInterval(stamp, stamp)
+                CoverageInterval(active.run_start, active.run_end)
             ])
-            active.run_start = None
-            active.run_end = None
+            active.run_start = stamp
+            active.run_end = stamp
             active.monotonic_window.clear()
+            active.monotonic_window.append(stamp)
             return
 
         active.run_start = stamp
