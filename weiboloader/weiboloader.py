@@ -335,6 +335,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
+            self._finalize_coverage(active)
             self._persist_progress(active)
             raise
         except Exception:
@@ -348,6 +349,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
+            self._finalize_coverage(active)
             self._persist_progress(active)
             return False
         finally:
@@ -420,6 +422,7 @@ class WeiboLoader:
 
     def flush(self) -> None:
         for active in list(self._active_progress.values()):
+            self._finalize_coverage(active)
             self._persist_progress(active)
 
     def _resolve_target(self, target: TargetSpec) -> _ResolvedTarget:
