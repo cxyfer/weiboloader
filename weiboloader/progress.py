@@ -40,6 +40,7 @@ class ProgressState:
     target_key: str
     resume: CursorState | None = None
     coverage: list[CoverageInterval] = field(default_factory=list)
+    coverage_options_hash: str | None = None
 
 
 class ProgressStore:
@@ -94,10 +95,12 @@ class ProgressStore:
                 data = json.load(f)
             if data.get("version") != VERSION or data.get("target_key") != target_key:
                 return None
+            coverage_blob = data.get("coverage", {})
             return ProgressState(
                 target_key=target_key,
                 resume=self._deserialize_resume(data.get("resume")),
-                coverage=self.deserialize_intervals(data.get("coverage", {}).get("intervals", [])),
+                coverage=self.deserialize_intervals(coverage_blob.get("intervals", [])),
+                coverage_options_hash=coverage_blob.get("options_hash"),
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning("corrupt progress %s: %s", target_key, e)
@@ -109,13 +112,17 @@ class ProgressStore:
         *,
         resume: CursorState | None = None,
         coverage: Iterable[CoverageInterval | tuple[datetime, datetime]] = (),
+        coverage_options_hash: str | None = None,
     ) -> None:
         path, _ = self._paths(target_key)
+        coverage_blob: dict[str, object] = {"intervals": self.serialize_intervals(coverage)}
+        if coverage_options_hash is not None:
+            coverage_blob["options_hash"] = coverage_options_hash
         payload = {
             "version": VERSION,
             "target_key": target_key,
             "resume": self._serialize_resume(resume),
-            "coverage": {"intervals": self.serialize_intervals(coverage)},
+            "coverage": coverage_blob,
         }
         fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
         try:
