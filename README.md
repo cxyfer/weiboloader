@@ -115,9 +115,12 @@ weiboloader --visitor-cookies 1234567890
 ### Progress persistence
 
 - The loader stores per-target progress in `output_dir/.progress/` by default.
-- Unified progress contains two parts: `resume` for cursor recovery after interruption, and `coverage` for incremental filtering across completed timestamp groups.
+- Unified progress contains two parts: `resume` for cursor recovery after interruption, and `coverage` for incremental filtering across completed timestamp intervals.
+- Coverage tracks **successful run intervals** (continuous sequences of successfully downloaded timestamp groups) rather than individual timestamps, enabling efficient skip of large covered ranges.
+- Both `resume` and `coverage` are **options-aware**: they only apply when download options (filters, patterns, etc.) match the stored hash. Legacy progress files without option hashes are safely ignored until rewritten.
 - A successful target completion clears `resume` and keeps `coverage`.
-- Interrupted or failed runs keep `resume` and only preserve confirmed `coverage`.
+- Interrupted or failed runs keep `resume` and flush all **sealed successful runs** to `coverage` (the current incomplete group is never flushed).
+- All stop points (target complete, download failure, Ctrl+C, `--count` limit, `--fast-update` early stop) flush sealed runs to ensure consistent progress state.
 - `--no-resume` disables cursor recovery but still allows coverage-based skipping.
 - `--no-coverage` disables coverage-based skipping but still allows resume state to be written.
 - Ctrl+C flushes the same unified progress state before exit.

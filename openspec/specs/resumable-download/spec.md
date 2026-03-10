@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Unified progress store
-The system SHALL persist per-target unified progress in `output_dir/.progress`, combining iterator `resume` state and incremental `coverage` state in a single JSON record.
+The system SHALL persist per-target unified progress in `output_dir/.progress`, combining iterator `resume` state and incremental `coverage` state in a single JSON record. Both `resume` and `coverage` are **options-aware** and only apply when download options match their stored hashes.
 
 #### Scenario: Freeze resume state mid-pagination
 - **WHEN** iterator has processed part of a target and the current post does not time out
@@ -14,6 +14,14 @@ The system SHALL persist per-target unified progress in `output_dir/.progress`, 
 #### Scenario: Ignore incompatible resume state
 - **WHEN** unified progress contains `resume` with a different `options_hash`
 - **THEN** system SHALL ignore the stored `resume` state and start from the beginning for iteration
+
+#### Scenario: Ignore incompatible coverage state
+- **WHEN** unified progress contains `coverage` with a different `options_hash` or missing `options_hash`
+- **THEN** system SHALL ignore the stored `coverage` intervals until new run rewrites them with matching hash
+
+#### Scenario: All stop points flush sealed runs
+- **WHEN** download stops (target complete, failure, Ctrl+C, `--count` limit, `--fast-update` early stop)
+- **THEN** system SHALL flush all sealed successful runs to `coverage` and persist unified progress atomically
 
 #### Scenario: Corrupt unified progress file
 - **WHEN** unified progress file exists but contains invalid JSON
