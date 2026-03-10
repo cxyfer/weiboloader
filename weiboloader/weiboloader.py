@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,6 +26,7 @@ CST = timezone(timedelta(hours=8))
 _STREAM_READ_TIMEOUT = 60
 _MEDIA_DOWNLOAD_TIMEOUT = 60
 _PER_MEDIA_TIMEOUT = 30
+_MONOTONIC_WINDOW_SIZE = 5
 
 
 @dataclass(slots=True)
@@ -38,7 +40,11 @@ class _ResolvedTarget:
 class _ActiveProgress:
     target_key: str
     resume: CursorState | None
-    coverage: list[CoverageInterval]
+    committed_coverage: list[CoverageInterval]
+    coverage_options_hash: str | None
+    run_start: datetime | None = None
+    run_end: datetime | None = None
+    monotonic_window: deque[datetime] = field(default_factory=lambda: deque(maxlen=_MONOTONIC_WINDOW_SIZE))
 
 
 class _PostIterator(NodeIterator):
@@ -143,12 +149,22 @@ class WeiboLoader:
         iterator = self._create_iterator(resolved.target)
         state = self._load_progress(resolved.key)
         resume = None
-        coverage = list(state.coverage) if state else []
-        if not self.no_resume and state and state.resume and state.resume.options_hash == self._options_hash:
-            iterator.thaw(state.resume)
-            resume = state.resume
+        committed_coverage: list[CoverageInterval] = []
+        coverage_options_hash: str | None = None
+        if state:
+            coverage_options_hash = state.coverage_options_hash
+            if coverage_options_hash == self._options_hash:
+                committed_coverage = list(state.coverage)
+            if not self.no_resume and state.resume and state.resume.options_hash == self._options_hash:
+                iterator.thaw(state.resume)
+                resume = state.resume
 
-        active = _ActiveProgress(target_key=resolved.key, resume=resume, coverage=coverage)
+        active = _ActiveProgress(
+            target_key=resolved.key,
+            resume=resume,
+            committed_coverage=committed_coverage,
+            coverage_options_hash=self._options_hash,
+        )
         self._active_progress[resolved.key] = active
 
         target_dir = self._build_dir(resolved)
@@ -178,14 +194,14 @@ class WeiboLoader:
 
                 created = self._cst(post.created_at)
                 if current_group_stamp is not None and created != current_group_stamp:
-                    self._finalize_group(active, current_group_stamp, current_group_ok)
+                    self._seal_group(active, current_group_stamp, current_group_ok)
                     if current_group_ok:
                         safe_resume = group_resume
                     active.resume = safe_resume
                     current_group_stamp = None
                     current_group_ok = True
 
-                if not self.no_coverage and ProgressStore.contains(active.coverage, created):
+                if not self.no_coverage and ProgressStore.contains(self._materialized_coverage(active), created):
                     continue
 
                 if current_group_stamp is None:
@@ -286,8 +302,9 @@ class WeiboLoader:
                 self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
             if target_complete:
-                self._finalize_group(active, current_group_stamp, current_group_ok)
+                self._seal_group(active, current_group_stamp, current_group_ok)
                 safe_resume = group_resume if current_group_ok else group_entry_resume
+            self._finalize_coverage(active, seal_last=target_complete)
             active.resume = safe_resume
             if ok and target_complete:
                 active.resume = None
@@ -318,6 +335,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
+            self._finalize_coverage(active)
             self._persist_progress(active)
             raise
         except Exception:
@@ -331,6 +349,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
+            self._finalize_coverage(active)
             self._persist_progress(active)
             return False
         finally:
@@ -403,6 +422,7 @@ class WeiboLoader:
 
     def flush(self) -> None:
         for active in list(self._active_progress.values()):
+            self._finalize_coverage(active)
             self._persist_progress(active)
 
     def _resolve_target(self, target: TargetSpec) -> _ResolvedTarget:
@@ -517,15 +537,56 @@ class WeiboLoader:
                 self._progress.save(
                     active.target_key,
                     resume=None if self.no_resume else active.resume,
-                    coverage=active.coverage,
+                    coverage=active.committed_coverage,
+                    coverage_options_hash=active.coverage_options_hash,
                 )
         except RuntimeError as e:
             raise CheckpointError(str(e)) from e
 
-    def _finalize_group(self, active: _ActiveProgress, stamp: datetime | None, ok: bool) -> None:
+    def _materialized_coverage(self, active: _ActiveProgress) -> list[CoverageInterval]:
+        if active.run_start is None or active.run_end is None:
+            return active.committed_coverage
+        return ProgressStore.normalize_intervals([
+            *active.committed_coverage,
+            CoverageInterval(active.run_start, active.run_end)
+        ])
+
+    def _seal_group(self, active: _ActiveProgress, stamp: datetime | None, ok: bool) -> None:
         if stamp is None or not ok or self.no_coverage:
             return
-        active.coverage = ProgressStore.normalize_intervals([*active.coverage, CoverageInterval(stamp, stamp)])
+
+        if active.run_start is None:
+            active.run_start = stamp
+            active.run_end = stamp
+            active.monotonic_window.append(stamp)
+            return
+
+        if len(active.monotonic_window) > 0 and stamp > active.monotonic_window[-1]:
+            active.committed_coverage = ProgressStore.normalize_intervals([
+                *active.committed_coverage,
+                CoverageInterval(active.run_start, active.run_end)
+            ])
+            active.run_start = stamp
+            active.run_end = stamp
+            active.monotonic_window.clear()
+            active.monotonic_window.append(stamp)
+            return
+
+        active.run_start = stamp
+        active.monotonic_window.append(stamp)
+
+    def _finalize_coverage(self, active: _ActiveProgress, seal_last: bool = False) -> None:
+        if self.no_coverage:
+            return
+
+        if active.run_start is not None and active.run_end is not None:
+            active.committed_coverage = ProgressStore.normalize_intervals([
+                *active.committed_coverage,
+                CoverageInterval(active.run_start, active.run_end)
+            ])
+            active.run_start = None
+            active.run_end = None
+            active.monotonic_window.clear()
 
     @staticmethod
     def _target_key(target: TargetSpec) -> str:

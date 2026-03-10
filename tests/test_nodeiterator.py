@@ -21,6 +21,7 @@ NodeIterator = import_module("weiboloader.nodeiterator").NodeIterator
 progress_module = import_module("weiboloader.progress")
 structures_module = import_module("weiboloader.structures")
 CoverageInterval = progress_module.CoverageInterval
+ProgressState = progress_module.ProgressState
 ProgressStore = progress_module.ProgressStore
 CursorState = structures_module.CursorState
 Post = structures_module.Post
@@ -81,18 +82,20 @@ class TestProgressStore:
             (start + timedelta(minutes=30), start + timedelta(hours=2, minutes=30)),
         ]
 
-        store.save(target_key, resume=resume, coverage=intervals)
+        store.save(target_key, resume=resume, coverage=intervals, coverage_options_hash="opts_abc")
         loaded = store.load(target_key)
 
         assert loaded is not None
         assert loaded.target_key == target_key
         assert loaded.resume == resume
         assert loaded.coverage == [CoverageInterval(start=start, end=start + timedelta(hours=3))]
+        assert loaded.coverage_options_hash == "opts_abc"
 
         path = store.dir / f"{store.target_hash(target_key)}.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["target_key"] == target_key
         assert payload["resume"]["page"] == resume.page
+        assert payload["coverage"]["options_hash"] == "opts_abc"
         assert payload["coverage"]["intervals"] == [
             {
                 "start": start.isoformat(),
@@ -198,6 +201,83 @@ class TestProgressStore:
         deserialized = ProgressStore.deserialize_intervals(serialized)
 
         assert deserialized == intervals
+
+    def test_legacy_progress_loads_without_crash(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:legacy"
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": "1",
+                "target_key": target_key,
+                "resume": None,
+                "coverage": {
+                    "intervals": [
+                        {"start": start.isoformat(), "end": (start + timedelta(hours=1)).isoformat()}
+                    ]
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        assert loaded.coverage == [CoverageInterval(start=start, end=start + timedelta(hours=1))]
+        assert loaded.coverage_options_hash is None
+
+    def test_save_without_coverage_options_hash_omits_key(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:nohash"
+        store.save(target_key, coverage=[])
+
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert "options_hash" not in payload["coverage"]
+
+    def test_coverage_options_hash_roundtrip(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:hashrt"
+        start = datetime(2024, 6, 1, tzinfo=UTC)
+        intervals = [CoverageInterval(start=start, end=start + timedelta(hours=2))]
+
+        store.save(target_key, coverage=intervals, coverage_options_hash="hash_v1")
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        assert loaded.coverage_options_hash == "hash_v1"
+        assert loaded.coverage == intervals
+
+    def test_coverage_options_mismatch_detectable(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:mismatch"
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+
+        store.save(
+            target_key,
+            coverage=[CoverageInterval(start=start, end=start + timedelta(hours=1))],
+            coverage_options_hash="hash_A",
+        )
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        current_hash = "hash_B"
+        assert loaded.coverage_options_hash != current_hash
+
+    def test_legacy_coverage_treated_as_incompatible(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:legcompat"
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+
+        store.save(target_key, coverage=[CoverageInterval(start=start, end=start + timedelta(hours=1))])
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        assert len(loaded.coverage) == 1
+        assert loaded.coverage_options_hash is None
+        compatible = loaded.coverage_options_hash is not None and loaded.coverage_options_hash == "any_hash"
+        assert compatible is False
 
 
 class TestNodeIterator:

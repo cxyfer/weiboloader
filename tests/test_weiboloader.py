@@ -247,6 +247,7 @@ class TestProgressPersistence:
                 timestamp="2024-01-01T00:00:00+08:00",
             ),
             coverage=[(datetime(2024, 1, 14, 12, 0, tzinfo=CST), datetime(2024, 1, 14, 12, 0, tzinfo=CST))],
+            coverage_options_hash="0e6b53042e140835",
         )
         loader = WeiboLoader(ctx, output_dir=tmp_path, no_resume=True)
 
@@ -288,7 +289,7 @@ class TestProgressPersistence:
         ts1 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
         ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
         ts3 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
-        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)])
+        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash="0e6b53042e140835")
 
         loader = WeiboLoader(ctx, output_dir=tmp_path)
         ctx._posts["u:test:p:1"] = ([
@@ -785,3 +786,117 @@ def test_progress_roundtrip_pbt(uid: str, ts):
         assert loaded is not None
         assert loaded.target_key == key
         assert [interval.start for interval in loaded.coverage] == [ts]
+
+
+class TestRunBasedCoverage:
+    """Tests for run-based interval coverage (Task 3)."""
+
+    def test_consecutive_successful_groups_merge_into_single_interval(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+            make_post("m3", ts3, [make_media("http://example.com/3.jpg")]),
+        ], None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert len(saved.coverage) == 1
+        assert saved.coverage[0].start == ts3
+        assert saved.coverage[0].end == ts1
+
+    def test_target_complete_flushes_sealed_run(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        ts1 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+        ], None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert len(saved.coverage) == 1
+        assert saved.coverage[0].start == ts2
+        assert saved.coverage[0].end == ts1
+
+    def test_count_limit_flushes_sealed_run_without_current_group(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, count=2)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+            make_post("m3", ts3, [make_media("http://example.com/3.jpg")]),
+        ], None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert len(saved.coverage) == 1
+        assert saved.coverage[0].start == ts1
+        assert saved.coverage[0].end == ts1
+
+    def test_monotonicity_break_flushes_and_resets_run(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 5, 12, 0, tzinfo=CST)
+        ts4 = datetime(2024, 1, 4, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+            make_post("m3", ts3, [make_media("http://example.com/3.jpg")]),
+            make_post("m4", ts4, [make_media("http://example.com/4.jpg")]),
+        ], None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert len(saved.coverage) == 2
+        intervals_sorted = sorted(saved.coverage, key=lambda x: x.start)
+        assert intervals_sorted[0].start == ts2
+        assert intervals_sorted[0].end == ts1
+        assert intervals_sorted[1].start == ts4
+        assert intervals_sorted[1].end == ts3
+
+    def test_coverage_options_mismatch_does_not_skip(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        store = ProgressStore(tmp_path / ".progress")
+        ts1 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store.save(target_key, coverage=[(ts1, ts1)], coverage_options_hash="wrong_hash")
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+        ], None)
+
+        download_names = []
+
+        def track_download(url, dest):
+            download_names.append(dest.name)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader, "_download", side_effect=track_download):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        assert len(download_names) == 1

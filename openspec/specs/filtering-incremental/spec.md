@@ -27,23 +27,31 @@ When `--fast-update` is enabled, the system SHALL stop fetching posts for a targ
 - **THEN** system SHALL process all posts (behaves like normal mode)
 
 ### Requirement: Coverage-based incremental updates
-The system SHALL persist per-target coverage in `output_dir/.progress` and use it to skip already confirmed timestamp groups on subsequent runs.
+The system SHALL persist per-target coverage as **successful run intervals** in `output_dir/.progress` and use it to skip already confirmed timestamp ranges on subsequent runs. Coverage is **options-aware** and only applies when download options match the stored hash.
 
 #### Scenario: First run creates coverage
 - **WHEN** unified progress for a target does not exist
-- **THEN** system SHALL download all posts and persist confirmed coverage for completed timestamp groups
+- **THEN** system SHALL download all posts and persist confirmed coverage as run intervals for completed timestamp groups
 
 #### Scenario: Coverage hit skips post but keeps scanning
 - **WHEN** unified progress already covers timestamp `2025-06-01T12:00:00+08:00`
 - **THEN** system SHALL skip posts at that timestamp and continue scanning older posts for uncovered gaps
 
-#### Scenario: Coverage advances only after full timestamp-group success
-- **WHEN** multiple posts share the same timestamp and all of them complete successfully
-- **THEN** system SHALL mark that timestamp group as covered
+#### Scenario: Coverage advances as run intervals
+- **WHEN** multiple consecutive timestamp groups complete successfully
+- **THEN** system SHALL merge them into a single coverage interval `[oldest_timestamp, newest_timestamp]`
 
 #### Scenario: Failed or timed-out posts do not advance coverage
 - **WHEN** a post in a timestamp group fails or times out
 - **THEN** system SHALL NOT advance coverage for that timestamp group
+
+#### Scenario: All stop points flush sealed runs
+- **WHEN** download stops (target complete, failure, Ctrl+C, `--count` limit, `--fast-update` early stop)
+- **THEN** system SHALL flush all sealed successful runs to coverage (current incomplete group is never flushed)
+
+#### Scenario: Options mismatch ignores legacy coverage
+- **WHEN** download options change (e.g., different filters or patterns)
+- **THEN** system SHALL ignore stored coverage until new run rewrites it with matching options hash
 
 #### Scenario: Idempotent incremental run with coverage
 - **WHEN** source data has not changed and prior coverage already spans all available timestamp groups
