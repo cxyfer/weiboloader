@@ -519,8 +519,6 @@ class WeiboLoader:
             "filename": self.filename_pattern,
             "no_videos": self.no_videos,
             "no_pictures": self.no_pictures,
-            "count": self.count,
-            "fast_update": self.fast_update,
         }
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode()).hexdigest()[:16]

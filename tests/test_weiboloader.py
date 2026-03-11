@@ -247,7 +247,7 @@ class TestProgressPersistence:
                 timestamp="2024-01-01T00:00:00+08:00",
             ),
             coverage=[(datetime(2024, 1, 14, 12, 0, tzinfo=CST), datetime(2024, 1, 14, 12, 0, tzinfo=CST))],
-            coverage_options_hash="0e6b53042e140835",
+            coverage_options_hash="59e0993c31f32f43",
         )
         loader = WeiboLoader(ctx, output_dir=tmp_path, no_resume=True)
 
@@ -289,7 +289,7 @@ class TestProgressPersistence:
         ts1 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
         ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
         ts3 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
-        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash="0e6b53042e140835")
+        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash="59e0993c31f32f43")
 
         loader = WeiboLoader(ctx, output_dir=tmp_path)
         ctx._posts["u:test:p:1"] = ([
