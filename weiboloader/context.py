@@ -351,6 +351,14 @@ class WeiboLoaderContext:
             return parse_post(status)
         raise TargetError(f"post not found: {mid}")
 
+    def _refresh_browser_cookies_for_captcha(self) -> None:
+        if not self._cookie_source_browser:
+            return
+        try:
+            self.load_browser_cookies(self._cookie_source_browser)
+        except Exception:
+            logger.debug("failed to refresh browser cookies for captcha", exc_info=True)
+
     def _build_captcha_probe(
         self,
         handler: Any,
@@ -360,11 +368,8 @@ class WeiboLoaderContext:
             return None
 
         def wrapped() -> bool:
-            if isinstance(handler, ManualCaptchaHandler) and self._cookie_source_browser:
-                try:
-                    self.load_browser_cookies(self._cookie_source_browser)
-                except Exception:
-                    logger.debug("failed to refresh browser cookies before captcha probe", exc_info=True)
+            if isinstance(handler, ManualCaptchaHandler):
+                self._refresh_browser_cookies_for_captcha()
             try:
                 return bool(probe())
             except Exception:
@@ -387,6 +392,8 @@ class WeiboLoaderContext:
                 pass
         try:
             solved = handler.solve(url, self.session, self.captcha_timeout, probe=probe)
+            if solved and isinstance(handler, ManualCaptchaHandler):
+                self._refresh_browser_cookies_for_captcha()
             if not solved and probe:
                 return probe()
             return solved
@@ -428,8 +435,8 @@ class WeiboLoaderContext:
     def _get_index(self, params: dict[str, Any]) -> dict[str, Any]:
         _CAPTCHA_URL = "https://m.weibo.cn/captcha/show?backUrl=https%3A%2F%2Fm.weibo.cn%2F"
         _MAX_CAPTCHA_ATTEMPTS = 2
-        _RECOVERY_POLLS = 2
-        _RECOVERY_DELAY = 1.0
+        _RECOVERY_POLLS = 60
+        _RECOVERY_DELAY = 5.0
 
         for attempt in range(_MAX_CAPTCHA_ATTEMPTS + 1):
             payload = self._get_index_payload(params)
@@ -439,7 +446,13 @@ class WeiboLoaderContext:
             if self.captcha_mode == "skip":
                 raise RateLimitError(payload.get("msg") or "rate limited (captcha)")
             if attempt < _MAX_CAPTCHA_ATTEMPTS:
-                solved = self._solve_captcha(_CAPTCHA_URL, probe=lambda: self._probe_index_ready(params))
+                captcha_url = _CAPTCHA_URL
+                if isinstance(payload, dict):
+                    for field in ("captcha_url", "url", "msg"):
+                        if field in payload and isinstance(payload[field], str) and "captcha" in payload[field].lower():
+                            captcha_url = payload[field]
+                            break
+                solved = self._solve_captcha(captcha_url, probe=lambda: self._probe_index_ready(params))
                 if solved:
                     for poll in range(_RECOVERY_POLLS):
                         if poll:

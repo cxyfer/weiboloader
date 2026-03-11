@@ -608,3 +608,74 @@ class TestGetIndexCaptcha:
         with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
             with pytest.raises(TargetError):
                 ctx._get_index({"type": "uid", "value": "123"})
+
+    def test_manual_captcha_refreshes_cookies_without_probe(self):
+        from weiboloader._captcha import ManualCaptchaHandler
+        ctx = WeiboLoaderContext(rate_controller=MockRateController(), captcha_mode="manual")
+        ctx._cookie_source_browser = "chrome"
+
+        with patch.object(ctx, "load_browser_cookies") as mock_load:
+            with patch.object(ManualCaptchaHandler, "solve", return_value=True):
+                result = ctx._solve_captcha("https://m.weibo.cn/captcha/show")
+
+        assert result is True
+        mock_load.assert_called_once_with("chrome")
+
+    @responses.activate
+    def test_slow_recovery_succeeds_on_third_poll(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "captcha"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "still processing"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "still processing"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True):
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+
+    @responses.activate
+    def test_very_slow_recovery_succeeds_on_fifth_poll(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "captcha"},
+        )
+        for _ in range(4):
+            responses.get(
+                "https://m.weibo.cn/api/container/getIndex",
+                json={"ok": 0, "msg": "still processing"},
+            )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True):
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+
+    @responses.activate
+    def test_recovery_timeout_after_sixty_polls(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "captcha"},
+        )
+        for _ in range(61):
+            responses.get(
+                "https://m.weibo.cn/api/container/getIndex",
+                json={"ok": 0, "msg": "still blocked"},
+            )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True):
+            with pytest.raises(TargetError, match="still blocked"):
+                ctx._get_index({"type": "uid", "value": "123"})
