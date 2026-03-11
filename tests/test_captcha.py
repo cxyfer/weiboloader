@@ -13,6 +13,7 @@ from weiboloader._captcha import (
     SkipCaptchaHandler,
     VisitorCookieFetcher,
     _is_captcha_url,
+    _page_done,
     extract_captcha_url,
     is_playwright_available,
 )
@@ -74,6 +75,20 @@ class TestExtractCaptchaUrl:
         resp.url = "https://api.weibo.cn/2/statuses"
         resp.headers = {}
         assert extract_captcha_url(resp) is None
+
+    def test_418_with_location_header(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 418
+        resp.url = "https://api.weibo.cn/2/statuses"
+        resp.headers = {"Location": "https://passport.weibo.com/verify"}
+        assert extract_captcha_url(resp) == "https://passport.weibo.com/verify"
+
+    def test_relative_location_normalized(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 302
+        resp.url = "https://passport.weibo.com/some/path"
+        resp.headers = {"Location": "/verify"}
+        assert extract_captcha_url(resp) == "https://passport.weibo.com/verify"
 
 
 class TestSkipCaptchaHandler:
@@ -156,3 +171,17 @@ class TestVisitorCookieFetcher:
         with patch.dict("sys.modules", {"playwright.sync_api": None}):
             with pytest.raises(ImportError):
                 fetcher.fetch()
+
+
+class TestPageDone:
+    def test_visitor_url_not_done(self):
+        page = MagicMock()
+        page.url = "https://passport.weibo.com/visitor/visitor?a=visitor"
+        page.is_closed.return_value = False
+        assert _page_done(page) is False
+
+    def test_normal_url_done(self):
+        page = MagicMock()
+        page.url = "https://m.weibo.cn/"
+        page.is_closed.return_value = False
+        assert _page_done(page) is True
