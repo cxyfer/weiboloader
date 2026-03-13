@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import requests
@@ -663,6 +663,44 @@ class TestGetIndexCaptcha:
         with patch.object(ctx, "_solve_captcha", return_value=True):
             data = ctx._get_index({"type": "uid", "value": "123"})
         assert data == {"cards": []}
+
+    @responses.activate
+    def test_msg_with_captcha_text_uses_default_captcha_url(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "msg": "need captcha"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+        mock_solve.assert_called_once_with(
+            "https://m.weibo.cn/captcha/show?backUrl=https%3A%2F%2Fm.weibo.cn%2F",
+            probe=ANY,
+        )
+
+    @responses.activate
+    def test_captcha_url_field_uses_absolute_url(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "captcha_url": "https://passport.weibo.com/verify"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+        mock_solve.assert_called_once_with(
+            "https://passport.weibo.com/verify",
+            probe=ANY,
+        )
 
     @responses.activate
     def test_recovery_timeout_after_sixty_polls(self):
