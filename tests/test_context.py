@@ -703,6 +703,25 @@ class TestGetIndexCaptcha:
         )
 
     @responses.activate
+    def test_url_field_uses_absolute_url(self):
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 0, "url": "https://passport.weibo.com/verify"},
+        )
+        responses.get(
+            "https://m.weibo.cn/api/container/getIndex",
+            json={"ok": 1, "data": {"cards": []}},
+        )
+        ctx = WeiboLoaderContext(rate_controller=MockRateController())
+        with patch.object(ctx, "_solve_captcha", return_value=True) as mock_solve:
+            data = ctx._get_index({"type": "uid", "value": "123"})
+        assert data == {"cards": []}
+        mock_solve.assert_called_once_with(
+            "https://passport.weibo.com/verify",
+            probe=ANY,
+        )
+
+    @responses.activate
     def test_recovery_timeout_after_sixty_polls(self):
         responses.get(
             "https://m.weibo.cn/api/container/getIndex",
