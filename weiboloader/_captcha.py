@@ -132,16 +132,6 @@ def _sync_cookies_to_session(session: requests.Session, cookies: list[dict[str, 
         session.cookies.set(name, value, domain=cookie.get("domain"), path=cookie.get("path", "/"))
 
 
-def _is_verification_flow_url(url: str) -> bool:
-    parts = urlparse(url)
-    netloc = parts.netloc.lower()
-    path = parts.path.lower()
-    if "passport.weibo" in netloc and path.startswith("/visitor/"):
-        return True
-    text = f"{netloc}{path}"
-    return any(h in text for h in ("passport.weibo", "login.sina", "verify", "captcha", "challenge"))
-
-
 def _page_done(page: Any) -> bool:
     try:
         if page.is_closed():
@@ -149,7 +139,7 @@ def _page_done(page: Any) -> bool:
     except Exception:
         return False
     try:
-        return not _is_verification_flow_url(page.url)
+        return not _is_captcha_url(page.url)
     except Exception:
         return False
 

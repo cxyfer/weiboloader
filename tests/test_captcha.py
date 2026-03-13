@@ -174,14 +174,20 @@ class TestVisitorCookieFetcher:
 
 
 class TestPageDone:
-    def test_visitor_url_not_done(self):
+    def test_visitor_url_done(self):
         page = MagicMock()
         page.url = "https://passport.weibo.com/visitor/visitor?a=visitor"
         page.is_closed.return_value = False
-        assert _page_done(page) is False
+        assert _page_done(page) is True
 
     def test_normal_url_done(self):
         page = MagicMock()
         page.url = "https://m.weibo.cn/"
         page.is_closed.return_value = False
         assert _page_done(page) is True
+
+    def test_verify_url_not_done(self):
+        page = MagicMock()
+        page.url = "https://passport.weibo.com/verify"
+        page.is_closed.return_value = False
+        assert _page_done(page) is False

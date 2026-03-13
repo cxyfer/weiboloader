@@ -17,6 +17,7 @@ from ._captcha import (
     PlaywrightCaptchaHandler,
     SkipCaptchaHandler,
     VisitorCookieFetcher,
+    _is_captcha_url,
     extract_captcha_url,
     is_playwright_available,
 )
@@ -359,6 +360,11 @@ class WeiboLoaderContext:
         except Exception:
             logger.debug("failed to refresh browser cookies for captcha", exc_info=True)
 
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        parsed = urlparse(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
     def _build_captcha_probe(
         self,
         handler: Any,
@@ -448,9 +454,10 @@ class WeiboLoaderContext:
             if attempt < _MAX_CAPTCHA_ATTEMPTS:
                 captcha_url = _CAPTCHA_URL
                 if isinstance(payload, dict):
-                    for field in ("captcha_url", "url", "msg"):
-                        if field in payload and isinstance(payload[field], str) and "captcha" in payload[field].lower():
-                            captcha_url = payload[field]
+                    for field in ("captcha_url", "url"):
+                        value = payload.get(field)
+                        if isinstance(value, str) and self._is_http_url(value) and _is_captcha_url(value):
+                            captcha_url = value
                             break
                 solved = self._solve_captcha(captcha_url, probe=lambda: self._probe_index_ready(params))
                 if solved:
