@@ -247,7 +247,9 @@ class ProgressStore:
         page_loaded = data.get("page_loaded")
         if not isinstance(page_loaded, bool):
             raise TypeError("resume page_loaded must be a bool")
-        options_hash = cls._optional_str(data.get("options_hash", ""), "resume options_hash")
+        options_hash = data["options_hash"]
+        if not isinstance(options_hash, str):
+            raise TypeError("resume options_hash must be a string")
         timestamp = cls._optional_str(data.get("timestamp"), "resume timestamp")
         posts = [cls._deserialize_post(post) for post in buffered_posts]
         has_saved_frontier = bool(posts) or pending_has_more or pending_cursor is not None
@@ -389,5 +391,5 @@ class ProgressStore:
     @staticmethod
     def _parse_any_datetime(value: object) -> datetime:
         if not isinstance(value, str):
-            raise TypeError("resume timestamp must be a string")
+            raise TypeError("resume post created_at must be a string")
         return datetime.fromisoformat(value)

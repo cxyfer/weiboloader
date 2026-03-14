@@ -290,6 +290,72 @@ class TestProgressStore:
 
         assert store.load(target_key) is None
 
+    def test_resume_options_hash_null_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": {
+                    "page": 1,
+                    "cursor": None,
+                    "seen_mids": [],
+                    "buffered_posts": [],
+                    "pending_cursor": None,
+                    "pending_has_more": False,
+                    "page_loaded": False,
+                    "options_hash": None,
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
+                "coverage": {"intervals": [], "options_hash": "abc123"},
+            }),
+            encoding="utf-8",
+        )
+
+        assert store.load(target_key) is None
+
+    def test_corrupt_post_created_at_logs_field_name(self, tmp_path: Path, caplog):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": {
+                    "page": 1,
+                    "cursor": None,
+                    "seen_mids": [],
+                    "buffered_posts": [
+                        {
+                            "mid": "m2",
+                            "bid": None,
+                            "text": "",
+                            "created_at": 123,
+                            "user": None,
+                            "media_items": [],
+                            "raw": {"mid": "m2"},
+                        }
+                    ],
+                    "pending_cursor": None,
+                    "pending_has_more": False,
+                    "page_loaded": True,
+                    "options_hash": "abc123",
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
+                "coverage": {"intervals": [], "options_hash": "abc123"},
+            }),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level("WARNING"):
+            result = store.load(target_key)
+
+        assert result is None
+        assert "resume post created_at must be a string" in caplog.text
+
     def test_atomic_write_leaves_no_tmp_files(self, tmp_path: Path):
         store = ProgressStore(tmp_path / ".progress")
         store.save("u:target", resume=make_resume_state(), coverage=[])
