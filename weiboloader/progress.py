@@ -61,30 +61,32 @@ class ProgressStore:
         _, lock_path = self._paths(target_key)
         lock_path.touch(exist_ok=True)
         with open(lock_path, "w") as f:
-            try:
-                if _IS_WIN:
-                    import msvcrt
+            if _IS_WIN:
+                import msvcrt
 
+                try:
                     msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                yield
-            except (BlockingIOError, OSError) as e:
-                raise RuntimeError(f"lock contention: {target_key}") from e
-            finally:
-                if _IS_WIN:
-                    import msvcrt
-
+                except OSError as e:
+                    raise RuntimeError(f"lock contention: {target_key}") from e
+                try:
+                    yield
+                finally:
                     try:
                         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
                     except OSError:
                         pass
-                else:
-                    import fcntl
+                return
 
-                    fcntl.flock(f, fcntl.LOCK_UN)
+            import fcntl
+
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as e:
+                raise RuntimeError(f"lock contention: {target_key}") from e
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def load(self, target_key: str) -> ProgressState | None:
         path, _ = self._paths(target_key)
@@ -130,16 +132,19 @@ class ProgressStore:
             "resume": self._serialize_resume(resume),
             "coverage": coverage_blob,
         }
-        fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
+        tmp_path: Path | None = None
         try:
+            fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
+            tmp_path = Path(tmp)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except Exception as e:
-            logger.error("progress save failed: %s", e)
-            Path(tmp).unlink(missing_ok=True)
+            os.replace(tmp_path, path)
+        except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
 
     def clear(self, target_key: str) -> None:
         path, _ = self._paths(target_key)

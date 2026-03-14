@@ -358,6 +358,17 @@ class WeiboLoader:
             self._commit_coverage_run(active)
             self._persist_progress(active)
             raise
+        except CheckpointError:
+            self._safe_emit(UIEvent(
+                kind=EventKind.TARGET_DONE,
+                target_key=resolved.key,
+                posts_processed=processed,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                ok=False,
+            ))
+            raise
         except Exception:
             logger.exception("download failed: %s", resolved.key)
             self._safe_emit(UIEvent(
@@ -563,7 +574,9 @@ class WeiboLoader:
                     coverage=active.committed_coverage,
                     coverage_options_hash=active.coverage_options_hash,
                 )
-        except RuntimeError as e:
+        except CheckpointError:
+            raise
+        except Exception as e:
             raise CheckpointError(str(e)) from e
 
     def _materialized_coverage(self, active: _ActiveProgress) -> list[CoverageInterval]:

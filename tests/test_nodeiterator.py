@@ -296,6 +296,47 @@ class TestProgressStore:
 
         assert list(store.dir.glob("*.tmp")) == []
 
+    @pytest.mark.parametrize("failure_point", ["mkstemp", "json.dump", "fsync", "replace"])
+    def test_save_failure_preserves_last_durable_checkpoint_bytes(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        failure_point: str,
+    ):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        store.save(target_key, resume=make_resume_state(page=1), coverage=[])
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        durable_bytes = path.read_bytes()
+        error = OSError(f"{failure_point} failed")
+
+        if failure_point == "mkstemp":
+            def fail_mkstemp(*args, **kwargs):
+                raise error
+
+            monkeypatch.setattr(progress_module.tempfile, "mkstemp", fail_mkstemp)
+        elif failure_point == "json.dump":
+            def fail_dump(*args, **kwargs):
+                raise error
+
+            monkeypatch.setattr(progress_module.json, "dump", fail_dump)
+        elif failure_point == "fsync":
+            def fail_fsync(*args, **kwargs):
+                raise error
+
+            monkeypatch.setattr(progress_module.os, "fsync", fail_fsync)
+        else:
+            def fail_replace(*args, **kwargs):
+                raise error
+
+            monkeypatch.setattr(progress_module.os, "replace", fail_replace)
+
+        with pytest.raises(OSError, match=f"{failure_point} failed"):
+            store.save(target_key, resume=make_resume_state(page=2), coverage=[])
+
+        assert path.read_bytes() == durable_bytes
+        assert list(store.dir.glob("*.tmp")) == []
+
     def test_lock_contention_raises(self, tmp_path: Path):
         store = ProgressStore(tmp_path / ".progress")
 

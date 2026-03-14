@@ -20,6 +20,7 @@ if not hasattr(certifi, "where"):
     certifi.where = lambda: ""
 
 from weiboloader.context import WeiboLoaderContext
+from weiboloader.exceptions import CheckpointError
 from weiboloader.progress import ProgressStore
 from weiboloader.structures import CursorState, MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, UserTarget
 from weiboloader.ui import DownloadResult, EventKind, MediaOutcome
@@ -868,6 +869,49 @@ class TestFaultIsolation:
 
         assert results["u:user1"] is True
         assert results["u:user2"] is False
+
+    def test_save_failure_raises_checkpoint_error_and_aborts_current_target(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        target = UserTarget(identifier="test", is_uid=True)
+        ctx._posts["u:test:p:1"] = ([make_post("m1")], None)
+
+        with patch.object(loader._progress, "save", side_effect=OSError("fsync failed")) as mock_save:
+            with pytest.raises(CheckpointError, match="fsync failed"):
+                loader.download_target(target)
+
+        assert mock_save.call_count == 1
+        assert load_progress_state(tmp_path, "u:test") is None
+
+    def test_lock_contention_raises_checkpoint_error(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        target = UserTarget(identifier="test", is_uid=True)
+        ctx._posts["u:test:p:1"] = ([make_post("m1")], None)
+
+        with patch.object(loader._progress, "acquire_lock", side_effect=RuntimeError("lock contention: u:test")):
+            with pytest.raises(CheckpointError, match="lock contention"):
+                loader.download_target(target)
+
+        assert load_progress_state(tmp_path, "u:test") is None
+
+    def test_download_targets_continues_after_checkpoint_error(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        target1 = UserTarget(identifier="user1", is_uid=True)
+        target2 = UserTarget(identifier="user2", is_uid=True)
+        ctx._posts["u:user1:p:1"] = ([make_post("m1")], None)
+        ctx._posts["u:user2:p:1"] = ([make_post("m2")], None)
+
+        def fail_first(target):
+            if target.identifier == "user1":
+                raise CheckpointError("rename failed")
+            return True
+
+        with patch.object(loader, "download_target", side_effect=fail_first):
+            results = loader.download_targets([target1, target2])
+
+        assert results == {"u:user1": False, "u:user2": True}
 
 
 class TestOptionsHash:
