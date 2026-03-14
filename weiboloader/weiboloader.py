@@ -117,7 +117,6 @@ class WeiboLoader:
         self._progress = ProgressStore(progress_dir)
         self._active_progress: dict[str, _ActiveProgress] = {}
 
-
     def _safe_emit(self, event: UIEvent) -> None:
         try:
             self._sink.emit(event)
@@ -158,6 +157,7 @@ class WeiboLoader:
             if not self.no_resume and state.resume and state.resume.options_hash == self._options_hash:
                 iterator.thaw(state.resume)
                 resume = state.resume
+        has_checkpoint_state = state is not None
 
         active = _ActiveProgress(
             target_key=resolved.key,
@@ -179,15 +179,18 @@ class WeiboLoader:
         safe_resume: CursorState | None = active.resume
         group_entry_resume: CursorState | None = active.resume
         group_resume: CursorState | None = active.resume
+        gap_open = False
         target_complete = True
 
         self._safe_emit(UIEvent(kind=EventKind.TARGET_START, target_key=resolved.key))
 
         exe = None
         shutdown_done = False
+        can_recover_latest_frontier = False
         try:
             exe = ThreadPoolExecutor(max_workers=self.max_workers)
             for post in iterator:
+                can_recover_latest_frontier = False
                 if self.count and processed >= self.count:
                     target_complete = False
                     break
@@ -195,8 +198,11 @@ class WeiboLoader:
                 created = self._cst(post.created_at)
                 if current_group_stamp is not None and created != current_group_stamp:
                     self._seal_group(active, current_group_stamp, current_group_ok)
-                    if current_group_ok:
+                    if current_group_ok and not gap_open:
                         safe_resume = group_resume
+                    if not current_group_ok:
+                        self._commit_coverage_run(active)
+                        gap_open = True
                     active.resume = safe_resume
                     current_group_stamp = None
                     current_group_ok = True
@@ -207,11 +213,11 @@ class WeiboLoader:
                 if current_group_stamp is None:
                     current_group_stamp = created
                     current_group_ok = True
-                    group_entry_resume = safe_resume
-                    group_resume = safe_resume
+                    group_entry_resume = active.resume if gap_open else safe_resume
+                    group_resume = group_entry_resume
 
                 jobs = self._media_jobs(target_dir, post)
-                if self.fast_update and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
+                if self.fast_update and not has_checkpoint_state and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
                     target_complete = False
                     break
 
@@ -293,21 +299,30 @@ class WeiboLoader:
                     current_group_ok = False
                     group_resume = group_entry_resume
                 if not timed_out:
+                    can_recover_latest_frontier = True
                     frozen = iterator.freeze()
                     if not self.no_resume:
                         if post_ok:
                             group_resume = frozen
-                        active.resume = group_resume
+                        active.resume = safe_resume if gap_open or not current_group_ok else group_resume
                     self._persist_progress(active)
+                    can_recover_latest_frontier = False
                 self._safe_emit(UIEvent(kind=EventKind.POST_DONE, posts_processed=processed))
 
             if target_complete:
                 self._seal_group(active, current_group_stamp, current_group_ok)
-                safe_resume = group_resume if current_group_ok else group_entry_resume
-            self._finalize_coverage(active, seal_last=target_complete)
-            active.resume = safe_resume
-            if ok and target_complete:
-                active.resume = None
+                if current_group_ok and not gap_open:
+                    safe_resume = group_resume
+                elif current_group_stamp is not None:
+                    gap_open = True
+                    safe_resume = group_entry_resume
+            self._finalize_coverage(active)
+
+            if target_complete:
+                active.resume = safe_resume
+                if ok and not gap_open:
+                    active.resume = None
+
             self._persist_progress(active)
 
             self._safe_emit(UIEvent(
@@ -322,6 +337,11 @@ class WeiboLoader:
             return ok
 
         except KeyboardInterrupt:
+            if can_recover_latest_frontier and not self.no_resume:
+                frozen = iterator.freeze()
+                if current_group_ok and not gap_open:
+                    group_resume = frozen
+                active.resume = safe_resume if gap_open or not current_group_ok else group_resume
             if exe is not None and not shutdown_done:
                 exe.shutdown(wait=False, cancel_futures=True)
                 shutdown_done = True
@@ -335,7 +355,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
-            self._finalize_coverage(active)
+            self._commit_coverage_run(active)
             self._persist_progress(active)
             raise
         except Exception:
@@ -349,7 +369,7 @@ class WeiboLoader:
                 failed=failed,
                 ok=False,
             ))
-            self._finalize_coverage(active)
+            self._commit_coverage_run(active)
             self._persist_progress(active)
             return False
         finally:
@@ -422,7 +442,7 @@ class WeiboLoader:
 
     def flush(self) -> None:
         for active in list(self._active_progress.values()):
-            self._finalize_coverage(active)
+            self._commit_coverage_run(active)
             self._persist_progress(active)
 
     def _resolve_target(self, target: TargetSpec) -> _ResolvedTarget:
@@ -514,11 +534,16 @@ class WeiboLoader:
         (target_dir / f"{post.mid}.txt").write_text(self.post_metadata_txt, encoding="utf-8")
 
     def _hash_options(self) -> str:
+        # Progress compatibility only depends on options that change filenames
+        # or create additional output files. Traversal-only flags such as count
+        # and fast_update must keep existing resume and coverage reusable.
         payload = {
             "dirname": self.dirname_pattern,
             "filename": self.filename_pattern,
             "no_videos": self.no_videos,
             "no_pictures": self.no_pictures,
+            "metadata_json": self.metadata_json,
+            "post_metadata_txt": self.post_metadata_txt,
         }
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -549,6 +574,18 @@ class WeiboLoader:
             CoverageInterval(active.run_start, active.run_end)
         ])
 
+    def _commit_coverage_run(self, active: _ActiveProgress) -> None:
+        if self.no_coverage:
+            return
+        if active.run_start is not None and active.run_end is not None:
+            active.committed_coverage = ProgressStore.normalize_intervals([
+                *active.committed_coverage,
+                CoverageInterval(active.run_start, active.run_end)
+            ])
+        active.run_start = None
+        active.run_end = None
+        active.monotonic_window.clear()
+
     def _seal_group(self, active: _ActiveProgress, stamp: datetime | None, ok: bool) -> None:
         if stamp is None or not ok or self.no_coverage:
             return
@@ -560,13 +597,9 @@ class WeiboLoader:
             return
 
         if len(active.monotonic_window) > 0 and stamp > active.monotonic_window[-1]:
-            active.committed_coverage = ProgressStore.normalize_intervals([
-                *active.committed_coverage,
-                CoverageInterval(active.run_start, active.run_end)
-            ])
+            self._commit_coverage_run(active)
             active.run_start = stamp
             active.run_end = stamp
-            active.monotonic_window.clear()
             active.monotonic_window.append(stamp)
             return
 
@@ -576,15 +609,7 @@ class WeiboLoader:
     def _finalize_coverage(self, active: _ActiveProgress, seal_last: bool = False) -> None:
         if self.no_coverage:
             return
-
-        if active.run_start is not None and active.run_end is not None:
-            active.committed_coverage = ProgressStore.normalize_intervals([
-                *active.committed_coverage,
-                CoverageInterval(active.run_start, active.run_end)
-            ])
-            active.run_start = None
-            active.run_end = None
-            active.monotonic_window.clear()
+        self._commit_coverage_run(active)
 
     @staticmethod
     def _target_key(target: TargetSpec) -> str:

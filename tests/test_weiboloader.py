@@ -22,7 +22,7 @@ if not hasattr(certifi, "where"):
 from weiboloader.context import WeiboLoaderContext
 from weiboloader.progress import ProgressStore
 from weiboloader.structures import CursorState, MediaItem, MidTarget, Post, SearchTarget, SuperTopicTarget, UserTarget
-from weiboloader.ui import DownloadResult, MediaOutcome
+from weiboloader.ui import DownloadResult, EventKind, MediaOutcome
 from weiboloader.weiboloader import WeiboLoader
 
 
@@ -236,6 +236,7 @@ class TestProgressPersistence:
     def test_no_resume_only_clears_resume(self, tmp_path: Path):
         ctx = MockContext()
         target_key = "u:test"
+        loader = WeiboLoader(ctx, output_dir=tmp_path, no_resume=True)
         store = ProgressStore(tmp_path / ".progress")
         store.save(
             target_key,
@@ -243,13 +244,16 @@ class TestProgressPersistence:
                 page=2,
                 cursor="cursor-2",
                 seen_mids=["old"],
-                options_hash="",
+                buffered_posts=[],
+                pending_cursor=None,
+                pending_has_more=False,
+                page_loaded=False,
+                options_hash=loader._options_hash,
                 timestamp="2024-01-01T00:00:00+08:00",
             ),
             coverage=[(datetime(2024, 1, 14, 12, 0, tzinfo=CST), datetime(2024, 1, 14, 12, 0, tzinfo=CST))],
-            coverage_options_hash="59e0993c31f32f43",
+            coverage_options_hash=loader._options_hash,
         )
-        loader = WeiboLoader(ctx, output_dir=tmp_path, no_resume=True)
 
         post = make_post("m1", created_at=datetime(2024, 1, 15, 12, 0, tzinfo=CST))
         ctx._posts["u:test:p:1"] = ([post], None)
@@ -285,13 +289,12 @@ class TestProgressPersistence:
     def test_gap_fill_rerun_only_downloads_uncovered_timestamp(self, tmp_path: Path):
         ctx = MockContext()
         target_key = "u:test"
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
         store = ProgressStore(tmp_path / ".progress")
         ts1 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
         ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
         ts3 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
-        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash="59e0993c31f32f43")
-
-        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash=loader._options_hash)
         ctx._posts["u:test:p:1"] = ([
             make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
             make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
@@ -405,6 +408,351 @@ class TestProgressPersistence:
         assert saved.resume is not None
         assert saved.coverage == [ProgressStore.normalize_intervals([(newer, newer)])[0]]
 
+    def test_failed_gap_preserves_resume_and_splits_coverage(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        target_key = "u:test"
+        newest = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        failed_stamp = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        oldest = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = (
+            [
+                make_post("m1", created_at=newest, media_items=[make_media("http://example.com/1.jpg")]),
+                make_post("m2", created_at=failed_stamp, media_items=[make_media("http://example.com/2.jpg")]),
+                make_post("m3", created_at=oldest, media_items=[make_media("http://example.com/3.jpg")]),
+            ],
+            None,
+        )
+
+        with patch.object(
+            loader,
+            "_download",
+            side_effect=[
+                DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg"),
+                DownloadResult(MediaOutcome.FAILED, tmp_path / "2.jpg"),
+                DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "3.jpg"),
+            ],
+        ):
+            result = loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        assert result is False
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["m2", "m3"]
+        intervals = sorted(saved.coverage, key=lambda interval: interval.start)
+        assert [(interval.start, interval.end) for interval in intervals] == [
+            (oldest, oldest),
+            (newest, newest),
+        ]
+
+    def test_interrupt_after_later_success_still_resumes_from_failed_gap(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        newest = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        failed_stamp = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        oldest = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = (
+            [
+                make_post("m1", created_at=newest, media_items=[make_media("http://example.com/1.jpg")]),
+                make_post("m2", created_at=failed_stamp, media_items=[make_media("http://example.com/2.jpg")]),
+                make_post("m3", created_at=oldest, media_items=[make_media("http://example.com/3.jpg")]),
+                make_post("m4", created_at=oldest, media_items=[make_media("http://example.com/4.jpg")]),
+            ],
+            None,
+        )
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        with patch.object(
+            loader,
+            "_download",
+            side_effect=[
+                DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg"),
+                DownloadResult(MediaOutcome.FAILED, tmp_path / "2.jpg"),
+                DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "3.jpg"),
+                KeyboardInterrupt("stop"),
+            ],
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["m2", "m3", "m4"]
+        assert [interval.start for interval in saved.coverage] == [newest]
+
+    def test_interrupt_after_success_before_checkpoint_keeps_latest_exact_frontier(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        target_key = "u:test"
+        newer = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = (
+            [
+                make_post("m1", created_at=newer, media_items=[make_media("http://example.com/1.jpg")]),
+                make_post("m2", created_at=older, media_items=[make_media("http://example.com/2.jpg")]),
+            ],
+            None,
+        )
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        iterator = loader._create_iterator(target)
+        original_freeze = iterator.freeze
+        freeze_calls = 0
+
+        def interrupt_once():
+            nonlocal freeze_calls
+            freeze_calls += 1
+            if freeze_calls == 1:
+                raise KeyboardInterrupt("stop after success before checkpoint")
+            return original_freeze()
+
+        with patch.object(loader, "_create_iterator", return_value=iterator):
+            with patch.object(iterator, "freeze", side_effect=interrupt_once):
+                with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg")):
+                    with pytest.raises(KeyboardInterrupt):
+                        loader.download_target(target)
+
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["m2"]
+        assert saved.resume.page_loaded is True
+        assert saved.coverage == []
+
+    def test_fast_update_keeps_latest_exact_resume_frontier(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        post1 = make_post("m1", ts1, [make_media("http://example.com/1.jpg")])
+        post2 = make_post("m2", ts2, [make_media("http://example.com/2.jpg")])
+        post3 = make_post("m3", ts3, [make_media("http://example.com/3.jpg")])
+        ctx._posts["u:test:p:1"] = ([post1, post2, post3], None)
+
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True)
+        target_dir = loader1._build_dir(loader1._resolve_target(target))
+        existing_path = loader1._media_jobs(target_dir, post2)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        first_run = []
+
+        def download_first(url, dest):
+            first_run.append(dest.name)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader1, "_download", side_effect=download_first):
+            assert loader1.download_target(target) is True
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["m2", "m3"]
+        assert [interval.start for interval in saved.coverage] == [ts1]
+
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path)
+        second_run = []
+
+        def download_second(url, dest):
+            second_run.append((dest.name, dest.exists()))
+            outcome = MediaOutcome.SKIPPED if dest.exists() and dest.stat().st_size > 0 else MediaOutcome.DOWNLOADED
+            return DownloadResult(outcome, dest)
+
+        with patch.object(loader2, "_download", side_effect=download_second):
+            assert loader2.download_target(target) is True
+
+        assert first_run == ["2024-01-03_media_0.jpg"]
+        assert second_run == [
+            ("2024-01-02_media_0.jpg", True),
+            ("2024-01-01_media_0.jpg", False),
+        ]
+
+    def test_fast_update_rerun_revisits_uncovered_existing_media(self, tmp_path: Path):
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        post1 = make_post("m1", ts1, [make_media("http://example.com/1.jpg")])
+        post2 = make_post("m2", ts2, [make_media("http://example.com/2.jpg")])
+        post3 = make_post("m3", ts3, [make_media("http://example.com/3.jpg")])
+        ctx._posts["u:test:p:1"] = ([post1, post2, post3], None)
+
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True)
+        target_dir = loader1._build_dir(loader1._resolve_target(target))
+        existing_path = loader1._media_jobs(target_dir, post2)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        with patch.object(loader1, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "first.jpg")):
+            assert loader1.download_target(target) is True
+
+        interrupted = load_progress_state(tmp_path, "u:test")
+        assert interrupted is not None
+        assert interrupted.resume is not None
+        assert [post.mid for post in interrupted.resume.buffered_posts] == ["m2", "m3"]
+        assert [interval.start for interval in interrupted.coverage] == [ts1]
+
+        sink = CollectorSink()
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True, progress=sink)
+
+        def resume_download(url, dest):
+            if dest.exists() and dest.stat().st_size > 0:
+                return DownloadResult(MediaOutcome.SKIPPED, dest)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader2, "_download", side_effect=resume_download):
+            assert loader2.download_target(target) is True
+
+        media_events = [event for event in sink.events if event.kind == EventKind.MEDIA_DONE]
+        assert [(event.filename, event.outcome) for event in media_events] == [
+            ("2024-01-02_media_0.jpg", MediaOutcome.SKIPPED),
+            ("2024-01-01_media_0.jpg", MediaOutcome.DOWNLOADED),
+        ]
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert saved.resume is None
+        assert len(saved.coverage) == 2
+        assert ProgressStore.contains(saved.coverage, ts1)
+        assert ProgressStore.contains(saved.coverage, ts2)
+        assert ProgressStore.contains(saved.coverage, ts3)
+
+    def test_fast_update_compatible_empty_checkpoint_revisits_existing_media(self, tmp_path: Path):
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        target_key = "u:test"
+        target = UserTarget(identifier="test", is_uid=True)
+        ts = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        post = make_post("m1", ts, [make_media("http://example.com/1.jpg")])
+        ctx._posts["u:test:p:1"] = ([post], None)
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True)
+        store = ProgressStore(tmp_path / ".progress")
+        store.save(target_key, coverage=[], coverage_options_hash=loader._options_hash)
+
+        target_dir = loader._build_dir(loader._resolve_target(target))
+        existing_path = loader._media_jobs(target_dir, post)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True, progress=sink)
+
+        with patch.object(loader, "_download", wraps=loader._download) as mock_download:
+            assert loader.download_target(target) is True
+
+        assert mock_download.call_count == 1
+        media_events = [event for event in sink.events if event.kind == EventKind.MEDIA_DONE]
+        assert [(event.filename, event.outcome) for event in media_events] == [
+            ("2024-01-02_media_0.jpg", MediaOutcome.SKIPPED),
+        ]
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert saved.resume is None
+        assert ProgressStore.contains(saved.coverage, ts)
+
+    def test_gap_fill_rerun_seals_group_after_mixed_downloaded_and_skipped_media(self, tmp_path: Path):
+        from tests.test_progress_ui import CollectorSink
+
+        ctx = MockContext()
+        target_key = "u:test"
+        target = UserTarget(identifier="test", is_uid=True)
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        store = ProgressStore(tmp_path / ".progress")
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store.save(target_key, coverage=[(ts1, ts1), (ts3, ts3)], coverage_options_hash=loader._options_hash)
+        covered_newer = make_post("m1", ts1, [make_media("http://example.com/1.jpg")])
+        gap_existing = make_post("m2", ts2, [make_media("http://example.com/2.jpg", index=0)])
+        gap_missing = make_post("m3", ts2, [make_media("http://example.com/3.jpg", index=1)])
+        covered_older = make_post("m4", ts3, [make_media("http://example.com/4.jpg")])
+        ctx._posts["u:test:p:1"] = ([covered_newer, gap_existing, gap_missing, covered_older], None)
+
+        target_dir = loader._build_dir(loader._resolve_target(target))
+        existing_path = loader._media_jobs(target_dir, gap_existing)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        sink = CollectorSink()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, progress=sink)
+
+        def track_download(url, dest):
+            if dest.exists() and dest.stat().st_size > 0:
+                return DownloadResult(MediaOutcome.SKIPPED, dest)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader, "_download", side_effect=track_download):
+            assert loader.download_target(target) is True
+
+        media_events = [event for event in sink.events if event.kind == EventKind.MEDIA_DONE]
+        assert [(event.filename, event.outcome) for event in media_events] == [
+            ("2024-01-02_media_0.jpg", MediaOutcome.SKIPPED),
+            ("2024-01-02_media_1.jpg", MediaOutcome.DOWNLOADED),
+        ]
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert saved.resume is None
+        assert ProgressStore.contains(saved.coverage, ts1)
+        assert ProgressStore.contains(saved.coverage, ts2)
+        assert ProgressStore.contains(saved.coverage, ts3)
+
+    def test_progressive_count_expansion_replays_saved_suffix_before_next_page(self, tmp_path: Path):
+        ctx = MockContext()
+        ts1 = datetime(2024, 1, 4, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts4 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+            make_post("m3", ts3, [make_media("http://example.com/3.jpg")]),
+        ], "cursor-2")
+        ctx._posts["u:test:p:2"] = ([
+            make_post("m4", ts4, [make_media("http://example.com/4.jpg")]),
+        ], None)
+
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, count=1)
+        first_run = []
+
+        def download_first(url, dest):
+            first_run.append(dest.name)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader1, "_download", side_effect=download_first):
+            assert loader1.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["m2", "m3"]
+        assert saved.resume.pending_cursor == "cursor-2"
+        assert saved.resume.pending_has_more is True
+        assert saved.resume.page_loaded is True
+
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, count=4)
+        second_run = []
+
+        def download_second(url, dest):
+            second_run.append(dest.name)
+            return DownloadResult(MediaOutcome.DOWNLOADED, dest)
+
+        with patch.object(loader2, "_download", side_effect=download_second):
+            assert loader2.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert first_run == ["2024-01-04_media_0.jpg"]
+        assert second_run == [
+            "2024-01-03_media_0.jpg",
+            "2024-01-02_media_0.jpg",
+            "2024-01-01_media_0.jpg",
+        ]
+
 
 class TestMetadataExport:
     def test_metadata_json_export(self, tmp_path: Path):
@@ -435,6 +783,38 @@ class TestMetadataExport:
         txt_path = target_dir / "m456.txt"
         assert txt_path.exists()
         assert txt_path.read_text() == "template content"
+
+    def test_metadata_json_hash_mismatch_reprocesses_covered_post(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store = ProgressStore(tmp_path / ".progress")
+        store.save(target_key, coverage=[(ts, ts)], coverage_options_hash=WeiboLoader(ctx, output_dir=tmp_path)._options_hash)
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path, metadata_json=True)
+        ctx._posts["u:test:p:1"] = ([make_post("m123", created_at=ts, media_items=[])], None)
+
+        with patch.object(loader, "_download") as mock_download:
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        assert not mock_download.called
+        assert (tmp_path / "User_test" / "m123.json").exists()
+
+    def test_post_metadata_txt_hash_mismatch_reprocesses_covered_post(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store = ProgressStore(tmp_path / ".progress")
+        store.save(target_key, coverage=[(ts, ts)], coverage_options_hash=WeiboLoader(ctx, output_dir=tmp_path)._options_hash)
+
+        loader = WeiboLoader(ctx, output_dir=tmp_path, post_metadata_txt="template content")
+        ctx._posts["u:test:p:1"] = ([make_post("m456", created_at=ts, media_items=[])], None)
+
+        with patch.object(loader, "_download") as mock_download:
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        assert not mock_download.called
+        assert (tmp_path / "User_test" / "m456.txt").read_text() == "template content"
 
 
 class TestTargetResolution:
@@ -491,19 +871,40 @@ class TestFaultIsolation:
 
 
 class TestOptionsHash:
-    def test_hash_changes_with_options(self, tmp_path: Path):
+    def test_hash_changes_with_media_filters(self, tmp_path: Path):
         ctx = MockContext()
         loader1 = WeiboLoader(ctx, output_dir=tmp_path, no_videos=True)
         loader2 = WeiboLoader(ctx, output_dir=tmp_path, no_videos=False)
 
         assert loader1._options_hash != loader2._options_hash
 
-    def test_hash_consistent(self, tmp_path: Path):
+    def test_hash_ignores_count(self, tmp_path: Path):
         ctx = MockContext()
-        loader1 = WeiboLoader(ctx, output_dir=tmp_path, count=10)
-        loader2 = WeiboLoader(ctx, output_dir=tmp_path, count=10)
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, count=1)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, count=99)
 
         assert loader1._options_hash == loader2._options_hash
+
+    def test_hash_ignores_fast_update(self, tmp_path: Path):
+        ctx = MockContext()
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, fast_update=False)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, fast_update=True)
+
+        assert loader1._options_hash == loader2._options_hash
+
+    def test_hash_changes_with_metadata_json(self, tmp_path: Path):
+        ctx = MockContext()
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, metadata_json=False)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, metadata_json=True)
+
+        assert loader1._options_hash != loader2._options_hash
+
+    def test_hash_changes_with_post_metadata_txt(self, tmp_path: Path):
+        ctx = MockContext()
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, post_metadata_txt=None)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, post_metadata_txt="template content")
+
+        assert loader1._options_hash != loader2._options_hash
 
 
 @given(st.integers(min_value=0, max_value=100))
@@ -878,6 +1279,36 @@ class TestRunBasedCoverage:
         assert intervals_sorted[1].start == ts4
         assert intervals_sorted[1].end == ts3
 
+    def test_monotonicity_break_does_not_bridge_overlapping_runs(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        ts1 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts2 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ts3 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ts4 = datetime(2024, 1, 4, 12, 0, tzinfo=CST)
+        ts5 = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        ts6 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("m1", ts1, [make_media("http://example.com/1.jpg")]),
+            make_post("m2", ts2, [make_media("http://example.com/2.jpg")]),
+            make_post("m3", ts3, [make_media("http://example.com/3.jpg")]),
+            make_post("m4", ts4, [make_media("http://example.com/4.jpg")]),
+            make_post("m5", ts5, [make_media("http://example.com/5.jpg")]),
+            make_post("m6", ts6, [make_media("http://example.com/6.jpg")]),
+        ], None)
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "test.jpg")):
+            loader.download_target(UserTarget(identifier="test", is_uid=True))
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert len(saved.coverage) == 2
+        intervals_sorted = sorted(saved.coverage, key=lambda x: x.start)
+        assert intervals_sorted[0].start == ts3
+        assert intervals_sorted[0].end == ts1
+        assert intervals_sorted[1].start == ts4
+        assert intervals_sorted[1].end == ts4
+
     def test_coverage_options_mismatch_does_not_skip(self, tmp_path: Path):
         ctx = MockContext()
         target_key = "u:test"
@@ -900,3 +1331,47 @@ class TestRunBasedCoverage:
             loader.download_target(UserTarget(identifier="test", is_uid=True))
 
         assert len(download_names) == 1
+
+    def test_coverage_hash_mismatch_fast_update_with_metadata_json_reprocesses_existing_media(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store = ProgressStore(tmp_path / ".progress")
+        store.save(target_key, coverage=[(ts, ts)], coverage_options_hash="wrong_hash")
+
+        target = UserTarget(identifier="test", is_uid=True)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, metadata_json=True, fast_update=True)
+        post = make_post("m123", created_at=ts, media_items=[make_media("http://example.com/1.jpg")])
+        ctx._posts["u:test:p:1"] = ([post], None)
+        target_dir = loader._build_dir(loader._resolve_target(target))
+        existing_path = loader._media_jobs(target_dir, post)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        with patch.object(loader, "_download", wraps=loader._download) as mock_download:
+            loader.download_target(target)
+
+        assert mock_download.call_count == 1
+        assert (tmp_path / "User_test" / "m123.json").exists()
+
+    def test_coverage_hash_mismatch_fast_update_with_post_metadata_txt_reprocesses_existing_media(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        store = ProgressStore(tmp_path / ".progress")
+        store.save(target_key, coverage=[(ts, ts)], coverage_options_hash="wrong_hash")
+
+        target = UserTarget(identifier="test", is_uid=True)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, post_metadata_txt="template content", fast_update=True)
+        post = make_post("m456", created_at=ts, media_items=[make_media("http://example.com/1.jpg")])
+        ctx._posts["u:test:p:1"] = ([post], None)
+        target_dir = loader._build_dir(loader._resolve_target(target))
+        existing_path = loader._media_jobs(target_dir, post)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+
+        with patch.object(loader, "_download", wraps=loader._download) as mock_download:
+            loader.download_target(target)
+
+        assert mock_download.call_count == 1
+        assert (tmp_path / "User_test" / "m456.txt").read_text() == "template content"
