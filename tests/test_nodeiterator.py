@@ -33,15 +33,15 @@ class MockIterator(NodeIterator):
     def __init__(self, posts_per_page: list[list[Post]], options_hash: str = ""):
         super().__init__(options_hash=options_hash)
         self._pages = posts_per_page
-        self._page_idx = 0
 
     def _fetch_page(self) -> tuple[list[Post], str | None, bool]:
-        if self._page_idx >= len(self._pages):
+        page_idx = self._page - 1
+        if page_idx >= len(self._pages):
             return [], None, False
-        posts = self._pages[self._page_idx]
-        self._page_idx += 1
-        cursor = f"cursor_{self._page_idx}" if self._page_idx < len(self._pages) else None
-        return posts, cursor, self._page_idx < len(self._pages)
+        posts = self._pages[page_idx]
+        has_more = self._page < len(self._pages)
+        cursor = f"cursor_{self._page + 1}" if has_more else None
+        return posts, cursor, has_more
 
 
 def make_post(mid: str, text: str = "") -> Post:
@@ -61,6 +61,10 @@ def make_resume_state(page: int = 5, options_hash: str = "abc123") -> CursorStat
         page=page,
         cursor=f"c{page}",
         seen_mids=[f"m{i}" for i in range(1, 3)],
+        buffered_posts=[],
+        pending_cursor=None,
+        pending_has_more=False,
+        page_loaded=False,
         options_hash=options_hash,
         timestamp="2024-01-01T00:00:00+00:00",
     )
@@ -114,6 +118,34 @@ class TestProgressStore:
         assert loaded.resume is None
         assert loaded.coverage == []
 
+    def test_terminal_final_page_resume_roundtrip(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target1"
+        post = make_post("m1")
+        it = MockIterator([[post]], options_hash="opts_abc")
+
+        assert next(it).mid == "m1"
+        state = it.freeze()
+        assert state.page_loaded is True
+        assert state.buffered_posts == []
+        assert state.pending_cursor is None
+        assert state.pending_has_more is False
+
+        store.save(target_key, resume=state, coverage_options_hash="opts_abc")
+        loaded = store.load(target_key)
+
+        assert loaded is not None
+        assert loaded.resume is not None
+        assert loaded.resume.page_loaded is True
+        assert loaded.resume.buffered_posts == []
+        assert loaded.resume.pending_cursor is None
+        assert loaded.resume.pending_has_more is False
+
+        resumed = MockIterator([[post]], options_hash="opts_abc")
+        resumed.thaw(loaded.resume)
+        with pytest.raises(StopIteration):
+            next(resumed)
+
     def test_corrupt_progress_logs_warning(self, tmp_path: Path, caplog):
         store = ProgressStore(tmp_path / ".progress")
         target_key = "u:target"
@@ -130,7 +162,131 @@ class TestProgressStore:
         store = ProgressStore(tmp_path / ".progress")
         target_key = "u:target"
         path = store.dir / f"{store.target_hash(target_key)}.json"
-        path.write_text(json.dumps({"version": "1", "target_key": "u:other"}), encoding="utf-8")
+        path.write_text(json.dumps({"version": progress_module.VERSION, "target_key": "u:other"}), encoding="utf-8")
+
+        assert store.load(target_key) is None
+
+    def test_version_mismatch_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(json.dumps({"version": "2", "target_key": target_key}), encoding="utf-8")
+
+        assert store.load(target_key) is None
+
+    def test_missing_version_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(json.dumps({"target_key": target_key}), encoding="utf-8")
+
+        assert store.load(target_key) is None
+
+    def test_legacy_resume_payload_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": {
+                    "page": 1,
+                    "cursor": None,
+                    "seen_mids": [],
+                    "options_hash": "abc123",
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
+                "coverage": {"intervals": [], "options_hash": "abc123"},
+            }),
+            encoding="utf-8",
+        )
+
+        assert store.load(target_key) is None
+
+    def test_malformed_top_level_payload_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text("[]", encoding="utf-8")
+
+        assert store.load(target_key) is None
+
+    def test_malformed_coverage_payload_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": None,
+                "coverage": [],
+            }),
+            encoding="utf-8",
+        )
+
+        assert store.load(target_key) is None
+
+    def test_inconsistent_resume_suffix_payload_returns_none(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": {
+                    "page": 1,
+                    "cursor": None,
+                    "seen_mids": [],
+                    "buffered_posts": [
+                        {
+                            "mid": "m2",
+                            "bid": None,
+                            "text": "",
+                            "created_at": datetime(2024, 1, 1, tzinfo=UTC).isoformat(),
+                            "user": None,
+                            "media_items": [],
+                            "raw": {"mid": "m2"},
+                        }
+                    ],
+                    "pending_cursor": None,
+                    "pending_has_more": False,
+                    "page_loaded": False,
+                    "options_hash": "abc123",
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
+                "coverage": {"intervals": [], "options_hash": "abc123"},
+            }),
+            encoding="utf-8",
+        )
+
+        assert store.load(target_key) is None
+
+    def test_seen_mids_must_be_list_of_strings(self, tmp_path: Path):
+        store = ProgressStore(tmp_path / ".progress")
+        target_key = "u:target"
+        path = store.dir / f"{store.target_hash(target_key)}.json"
+        path.write_text(
+            json.dumps({
+                "version": progress_module.VERSION,
+                "target_key": target_key,
+                "resume": {
+                    "page": 1,
+                    "cursor": None,
+                    "seen_mids": "m123",
+                    "buffered_posts": [],
+                    "pending_cursor": None,
+                    "pending_has_more": False,
+                    "page_loaded": False,
+                    "options_hash": "abc123",
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
+                "coverage": {"intervals": [], "options_hash": "abc123"},
+            }),
+            encoding="utf-8",
+        )
 
         assert store.load(target_key) is None
 
@@ -202,14 +358,14 @@ class TestProgressStore:
 
         assert deserialized == intervals
 
-    def test_legacy_progress_loads_without_crash(self, tmp_path: Path):
+    def test_schema_v3_coverage_without_resume_loads(self, tmp_path: Path):
         store = ProgressStore(tmp_path / ".progress")
         target_key = "u:legacy"
         start = datetime(2024, 1, 1, tzinfo=UTC)
         path = store.dir / f"{store.target_hash(target_key)}.json"
         path.write_text(
             json.dumps({
-                "version": "1",
+                "version": progress_module.VERSION,
                 "target_key": target_key,
                 "resume": None,
                 "coverage": {
@@ -326,6 +482,42 @@ class TestNodeIterator:
         remaining = [p.mid for p in it2]
         assert remaining == ["m2", "m3"]
 
+    def test_freeze_captures_current_page_suffix_snapshot(self):
+        posts1 = [make_post("m1"), make_post("m2"), make_post("m3")]
+        posts2 = [make_post("m4")]
+        it = MockIterator([posts1, posts2], options_hash="test")
+
+        assert next(it).mid == "m1"
+        state = it.freeze()
+
+        assert [post.mid for post in state.buffered_posts] == ["m2", "m3"]
+        assert state.pending_cursor == "cursor_2"
+        assert state.pending_has_more is True
+        assert state.page_loaded is True
+        assert state.page == 1
+        assert state.options_hash == "test"
+
+    def test_thaw_replays_saved_suffix_before_fetching_later_pages(self):
+        posts1 = [make_post("m1"), make_post("m2"), make_post("m3")]
+        posts2 = [make_post("m4"), make_post("m5")]
+        state = CursorState(
+            page=1,
+            cursor=None,
+            seen_mids=["m1"],
+            buffered_posts=[posts1[1], posts1[2]],
+            pending_cursor="cursor_2",
+            pending_has_more=True,
+            page_loaded=True,
+            options_hash="test",
+            timestamp="2024-01-01T00:00:00+00:00",
+        )
+
+        it = MockIterator([posts1, posts2], options_hash="test")
+        it.thaw(state)
+
+        remaining = [p.mid for p in it]
+        assert remaining == ["m2", "m3", "m4", "m5"]
+
     def test_freeze_idempotent(self):
         it = MockIterator([[make_post("m1")]], options_hash="test")
         state1 = it.freeze()
@@ -359,6 +551,10 @@ def test_checkpoint_roundtrip_property(page):
         page=page,
         cursor=f"cursor_{page}",
         seen_mids=[f"mid_{i}" for i in range(min(page, 10))],
+        buffered_posts=[],
+        pending_cursor=None,
+        pending_has_more=False,
+        page_loaded=False,
         options_hash="test",
         timestamp=datetime.now().isoformat(),
     )

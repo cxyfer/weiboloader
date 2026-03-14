@@ -48,6 +48,10 @@ class CursorState:
     page: int
     cursor: str | None = None
     seen_mids: list[str] = field(default_factory=list)
+    buffered_posts: list[Post] = field(default_factory=list)
+    pending_cursor: str | None = None
+    pending_has_more: bool = False
+    page_loaded: bool = False
     options_hash: str = ""
     timestamp: str | None = None
 
