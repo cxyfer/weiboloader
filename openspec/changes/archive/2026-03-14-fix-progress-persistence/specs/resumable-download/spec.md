@@ -1,6 +1,5 @@
-## Purpose
-Define resumable download progress persistence, rerun semantics, and atomic checkpoint behavior.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: Unified progress store
 The system SHALL persist per-target unified progress in `output_dir/.progress` as a single schema-version-3 JSON record. The record MUST keep `resume` and `coverage` as independent, options-aware state components: `resume` MUST represent the exact unfinished iterator frontier, including the current page's unconsumed suffix snapshot, while `coverage` MUST represent only fully sealed successful timestamp ranges.
 
@@ -51,44 +50,7 @@ Unified progress files MUST be written atomically using tmp-file + rename, and c
 - **WHEN** one target in a multi-target run fails with `CheckpointError`
 - **THEN** system SHALL mark that target as failed while allowing later targets in the same invocation to continue
 
-### Requirement: File existence skip
-The system SHALL skip downloading media files that already exist on disk with size > 0 bytes.
-
-#### Scenario: File exists with content
-- **WHEN** target file exists and has size > 0
-- **THEN** system SHALL skip the download and not make an HTTP request
-
-#### Scenario: File exists but empty
-- **WHEN** target file exists but has size == 0
-- **THEN** system SHALL re-download the file (treat as incomplete)
-
-#### Scenario: File does not exist
-- **WHEN** target file does not exist
-- **THEN** system SHALL download the file
-
-### Requirement: Partial download protection
-Media downloads MUST be written to a `.part` temporary file first, then renamed to the final filename upon completion.
-
-#### Scenario: Download completes successfully
-- **WHEN** media file download finishes without error
-- **THEN** system SHALL rename `{filename}.part` to `{filename}`
-
-#### Scenario: Download interrupted
-- **WHEN** download is interrupted mid-transfer
-- **THEN** the `.part` file SHALL remain on disk; the final filename SHALL NOT exist
-
-### Requirement: Disable resume option
-The system SHALL support `--no-resume` to disable restoring iterator cursor state from unified progress.
-
-#### Scenario: No-resume flag
-- **WHEN** user passes `--no-resume`
-- **THEN** system SHALL ignore existing `resume` state and start iteration from the beginning, while leaving stored `coverage` behavior unchanged
-
-<!-- PBT: thaw(freeze(state)).next() == state.next() (round-trip) -->
-<!-- PBT: freeze without advancing → identical serialized output (idempotent) -->
-<!-- PBT: cursor monotonically advances; no mid is yielded twice -->
-<!-- PBT: unified progress file is always valid JSON or absent (atomic write) -->
-<!-- PBT: exists && size>0 → skip; size==0 || !exists → download -->
+## ADDED Requirements
 
 ### Requirement: Group-atomic coverage sealing
 The system SHALL materialize `coverage` only from fully successful timestamp groups normalized by `_cst(post.created_at)`, and SHALL preserve gaps across failed, unfinished, or non-monotonic groups.

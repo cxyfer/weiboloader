@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import sys
+import types
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "weiboloader"
+if "weiboloader" not in sys.modules:
+    package = types.ModuleType("weiboloader")
+    package.__path__ = [str(_PACKAGE_ROOT)]
+    sys.modules["weiboloader"] = package
 
 from weiboloader.structures import (
     CursorState,
@@ -66,6 +75,10 @@ def test_cursor_state_defaults() -> None:
     cs = CursorState(page=1)
     assert cs.cursor is None
     assert cs.seen_mids == []
+    assert cs.buffered_posts == []
+    assert cs.pending_cursor is None
+    assert cs.pending_has_more is False
+    assert cs.page_loaded is False
     assert cs.options_hash == ""
     assert cs.timestamp is None
 

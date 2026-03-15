@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .structures import CursorState
+from .structures import CursorState, MediaItem, Post, User
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Sequence
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 _IS_WIN = sys.platform == "win32"
 
 logger = logging.getLogger(__name__)
-VERSION = "1"
+VERSION = "3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,30 +61,32 @@ class ProgressStore:
         _, lock_path = self._paths(target_key)
         lock_path.touch(exist_ok=True)
         with open(lock_path, "w") as f:
-            try:
-                if _IS_WIN:
-                    import msvcrt
+            if _IS_WIN:
+                import msvcrt
 
+                try:
                     msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                yield
-            except (BlockingIOError, OSError) as e:
-                raise RuntimeError(f"lock contention: {target_key}") from e
-            finally:
-                if _IS_WIN:
-                    import msvcrt
-
+                except OSError as e:
+                    raise RuntimeError(f"lock contention: {target_key}") from e
+                try:
+                    yield
+                finally:
                     try:
                         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
                     except OSError:
                         pass
-                else:
-                    import fcntl
+                return
 
-                    fcntl.flock(f, fcntl.LOCK_UN)
+            import fcntl
+
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as e:
+                raise RuntimeError(f"lock contention: {target_key}") from e
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
     def load(self, target_key: str) -> ProgressState | None:
         path, _ = self._paths(target_key)
@@ -93,9 +95,15 @@ class ProgressStore:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise TypeError("progress payload must be an object")
             if data.get("version") != VERSION or data.get("target_key") != target_key:
                 return None
             coverage_blob = data.get("coverage", {})
+            if coverage_blob is None:
+                coverage_blob = {}
+            if not isinstance(coverage_blob, dict):
+                raise TypeError("coverage payload must be an object")
             return ProgressState(
                 target_key=target_key,
                 resume=self._deserialize_resume(data.get("resume")),
@@ -124,16 +132,19 @@ class ProgressStore:
             "resume": self._serialize_resume(resume),
             "coverage": coverage_blob,
         }
-        fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
+        tmp_path: Path | None = None
         try:
+            fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
+            tmp_path = Path(tmp)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except Exception as e:
-            logger.error("progress save failed: %s", e)
-            Path(tmp).unlink(missing_ok=True)
+            os.replace(tmp_path, path)
+        except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
 
     def clear(self, target_key: str) -> None:
         path, _ = self._paths(target_key)
@@ -197,31 +208,162 @@ class ProgressStore:
             )
         return cls.normalize_intervals(intervals)
 
-    @staticmethod
-    def _serialize_resume(state: CursorState | None) -> dict[str, object] | None:
+    @classmethod
+    def _serialize_resume(cls, state: CursorState | None) -> dict[str, object] | None:
         if state is None:
             return None
         return {
             "page": state.page,
             "cursor": state.cursor,
             "seen_mids": state.seen_mids,
+            "buffered_posts": [cls._serialize_post(post) for post in state.buffered_posts],
+            "pending_cursor": state.pending_cursor,
+            "pending_has_more": state.pending_has_more,
+            "page_loaded": state.page_loaded,
             "options_hash": state.options_hash,
             "timestamp": state.timestamp,
         }
 
-    @staticmethod
-    def _deserialize_resume(data: object) -> CursorState | None:
+    @classmethod
+    def _deserialize_resume(cls, data: object) -> CursorState | None:
         if data is None:
             return None
         if not isinstance(data, dict):
             raise TypeError("resume payload must be an object")
+        page = data["page"]
+        if not isinstance(page, int) or page < 1:
+            raise TypeError("resume page must be a positive integer")
+        cursor = cls._optional_str(data.get("cursor"), "resume cursor")
+        seen_raw = data.get("seen_mids", [])
+        if not isinstance(seen_raw, list) or not all(isinstance(item, str) for item in seen_raw):
+            raise TypeError("resume seen_mids must be a list of strings")
+        buffered_posts = data.get("buffered_posts")
+        if not isinstance(buffered_posts, list):
+            raise TypeError("resume buffered_posts must be a list")
+        pending_cursor = cls._optional_str(data.get("pending_cursor"), "resume pending_cursor")
+        pending_has_more = data.get("pending_has_more")
+        if not isinstance(pending_has_more, bool):
+            raise TypeError("resume pending_has_more must be a bool")
+        page_loaded = data.get("page_loaded")
+        if not isinstance(page_loaded, bool):
+            raise TypeError("resume page_loaded must be a bool")
+        options_hash = data["options_hash"]
+        if not isinstance(options_hash, str):
+            raise TypeError("resume options_hash must be a string")
+        timestamp = cls._optional_str(data.get("timestamp"), "resume timestamp")
+        posts = [cls._deserialize_post(post) for post in buffered_posts]
+        has_saved_frontier = bool(posts) or pending_has_more or pending_cursor is not None
+        if not page_loaded and has_saved_frontier:
+            raise ValueError("resume page_loaded inconsistent with saved frontier")
+        if not page_loaded and posts:
+            raise ValueError("resume buffered_posts require page_loaded")
+        if not pending_has_more and pending_cursor is not None:
+            raise ValueError("resume pending_cursor requires pending_has_more")
         return CursorState(
-            page=data["page"],
-            cursor=data.get("cursor"),
-            seen_mids=list(data.get("seen_mids", [])),
-            options_hash=data.get("options_hash", ""),
-            timestamp=data.get("timestamp"),
+            page=page,
+            cursor=cursor,
+            seen_mids=list(seen_raw),
+            buffered_posts=posts,
+            pending_cursor=pending_cursor,
+            pending_has_more=pending_has_more,
+            page_loaded=page_loaded,
+            options_hash=options_hash or "",
+            timestamp=timestamp,
         )
+
+    @staticmethod
+    def _serialize_post(post: Post) -> dict[str, object]:
+        return {
+            "mid": post.mid,
+            "bid": post.bid,
+            "text": post.text,
+            "created_at": post.created_at.isoformat(),
+            "user": ProgressStore._serialize_user(post.user),
+            "media_items": [ProgressStore._serialize_media_item(item) for item in post.media_items],
+            "raw": post.raw,
+        }
+
+    @classmethod
+    def _deserialize_post(cls, data: object) -> Post:
+        if not isinstance(data, dict):
+            raise TypeError("resume post must be an object")
+        media_items = data.get("media_items")
+        if not isinstance(media_items, list):
+            raise TypeError("resume post media_items must be a list")
+        return Post(
+            mid=str(data["mid"]),
+            bid=data.get("bid"),
+            text=str(data.get("text", "")),
+            created_at=cls._parse_any_datetime(data["created_at"]),
+            user=cls._deserialize_user(data.get("user")),
+            media_items=[cls._deserialize_media_item(item) for item in media_items],
+            raw=cls._require_dict(data.get("raw")),
+        )
+
+    @staticmethod
+    def _serialize_user(user: User | None) -> dict[str, object] | None:
+        if user is None:
+            return None
+        return {
+            "uid": user.uid,
+            "nickname": user.nickname,
+            "avatar": user.avatar,
+            "raw": user.raw,
+        }
+
+    @classmethod
+    def _deserialize_user(cls, data: object) -> User | None:
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise TypeError("resume user must be an object")
+        return User(
+            uid=str(data["uid"]),
+            nickname=str(data["nickname"]),
+            avatar=data.get("avatar"),
+            raw=cls._require_dict(data.get("raw")),
+        )
+
+    @staticmethod
+    def _serialize_media_item(item: MediaItem) -> dict[str, object]:
+        return {
+            "media_type": item.media_type,
+            "url": item.url,
+            "index": item.index,
+            "filename_hint": item.filename_hint,
+            "raw": item.raw,
+        }
+
+    @classmethod
+    def _deserialize_media_item(cls, data: object) -> MediaItem:
+        if not isinstance(data, dict):
+            raise TypeError("resume media item must be an object")
+        media_type = data["media_type"]
+        if media_type not in {"picture", "video"}:
+            raise ValueError("resume media item type invalid")
+        return MediaItem(
+            media_type=media_type,
+            url=str(data["url"]),
+            index=int(data["index"]),
+            filename_hint=data.get("filename_hint"),
+            raw=cls._require_dict(data.get("raw")),
+        )
+
+    @staticmethod
+    def _require_dict(value: object) -> dict:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise TypeError("resume raw payload must be an object")
+        return dict(value)
+
+    @staticmethod
+    def _optional_str(value: object, name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string")
+        return value
 
     @classmethod
     def _coerce_interval(cls, interval: CoverageInterval | tuple[datetime, datetime]) -> CoverageInterval:
@@ -245,3 +387,9 @@ class ProgressStore:
         if not isinstance(value, str):
             raise TypeError("coverage timestamp must be a string")
         return cls._require_aware(datetime.fromisoformat(value))
+
+    @staticmethod
+    def _parse_any_datetime(value: object) -> datetime:
+        if not isinstance(value, str):
+            raise TypeError("resume post created_at must be a string")
+        return datetime.fromisoformat(value)
