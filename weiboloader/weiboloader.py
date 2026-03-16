@@ -158,6 +158,7 @@ class WeiboLoader:
                 iterator.thaw(state.resume)
                 resume = state.resume
         has_checkpoint_state = state is not None
+        output_compatible = coverage_options_hash == self._options_hash
 
         active = _ActiveProgress(
             target_key=resolved.key,
@@ -222,9 +223,9 @@ class WeiboLoader:
                     break
 
                 if self.metadata_json:
-                    self._write_json(target_dir, post)
+                    self._write_json(target_dir, post, output_compatible=output_compatible)
                 if self.post_metadata_txt:
-                    self._write_txt(target_dir, post)
+                    self._write_txt(target_dir, post, output_compatible=output_compatible)
 
                 media_total = len(jobs)
                 media_done = 0
@@ -232,7 +233,7 @@ class WeiboLoader:
                 timed_out = False
                 post_ok = True
 
-                future_to_path = {exe.submit(self._download, m.url, p): p for m, p in jobs}
+                future_to_path = {exe.submit(self._download_media, post, m.url, p): p for m, p in jobs}
                 post_timeout = max(60, media_total * _PER_MEDIA_TIMEOUT) if future_to_path else None
 
                 if future_to_path:
@@ -451,6 +452,43 @@ class WeiboLoader:
             if resp:
                 resp.close()
 
+    def _apply_post_mtime(self, path: Path, post: Post) -> None:
+        epoch = self._cst(post.created_at).timestamp()
+        atime = path.stat().st_atime
+        os.utime(path, (atime, epoch))
+
+    def _discard_failed_file(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.exception("failed to remove landed file: %s", path)
+            raise OSError(f"failed to remove landed file: {path}") from exc
+
+    def _write_sidecar(self, path: Path, content: str) -> None:
+        part = path.with_suffix(f"{path.suffix}.part")
+        try:
+            part.write_text(content, encoding="utf-8")
+            os.replace(part, path)
+        except Exception:
+            part.unlink(missing_ok=True)
+            raise
+
+    def _download_media(self, post: Post, url: str, dest: Path) -> DownloadResult:
+        result = self._download(url, dest)
+        if result.outcome != MediaOutcome.DOWNLOADED or not result.path.exists():
+            return result
+        try:
+            self._apply_post_mtime(result.path, post)
+            return result
+        except Exception as mtime_exc:
+            logger.exception("failed to apply media mtime: %s", result.path)
+            try:
+                self._discard_failed_file(result.path)
+            except Exception as cleanup_exc:
+                logger.exception("failed cleanup after media mtime error: %s", result.path)
+                raise mtime_exc from cleanup_exc
+            return DownloadResult(MediaOutcome.FAILED, result.path)
+
     def flush(self) -> None:
         for active in list(self._active_progress.values()):
             self._commit_coverage_run(active)
@@ -536,13 +574,39 @@ class WeiboLoader:
                 return candidate
             i += 1
 
-    def _write_json(self, target_dir: Path, post: Post) -> None:
-        (target_dir / f"{post.mid}.json").write_text(json.dumps(post.raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _write_json(self, target_dir: Path, post: Post, output_compatible: bool) -> None:
+        path = target_dir / f"{post.mid}.json"
+        if output_compatible and path.exists() and path.stat().st_size > 0:
+            return
+        self._write_sidecar(path, json.dumps(post.raw, ensure_ascii=False, indent=2))
+        try:
+            self._apply_post_mtime(path, post)
+        except Exception as mtime_exc:
+            logger.exception("failed to apply sidecar mtime: %s", path)
+            try:
+                self._discard_failed_file(path)
+            except Exception as cleanup_exc:
+                logger.exception("failed cleanup after sidecar mtime error: %s", path)
+                raise mtime_exc from cleanup_exc
+            raise
 
-    def _write_txt(self, target_dir: Path, post: Post) -> None:
+    def _write_txt(self, target_dir: Path, post: Post, output_compatible: bool) -> None:
         if not self.post_metadata_txt:
             return
-        (target_dir / f"{post.mid}.txt").write_text(self.post_metadata_txt, encoding="utf-8")
+        path = target_dir / f"{post.mid}.txt"
+        if output_compatible and path.exists() and path.stat().st_size > 0:
+            return
+        self._write_sidecar(path, self.post_metadata_txt)
+        try:
+            self._apply_post_mtime(path, post)
+        except Exception as mtime_exc:
+            logger.exception("failed to apply sidecar mtime: %s", path)
+            try:
+                self._discard_failed_file(path)
+            except Exception as cleanup_exc:
+                logger.exception("failed cleanup after sidecar mtime error: %s", path)
+                raise mtime_exc from cleanup_exc
+            raise
 
     def _hash_options(self) -> str:
         # Progress compatibility only depends on options that change filenames
