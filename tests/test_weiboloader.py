@@ -186,6 +186,35 @@ class TestDownloadMedia:
         assert media_path.exists()
         assert abs(media_path.stat().st_mtime - loader._cst(created_at).timestamp()) <= 1.0
 
+    def test_apply_post_mtime_preserves_existing_atime(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        path = tmp_path / "artifact.txt"
+        path.write_text("payload", encoding="utf-8")
+        original_atime = datetime(2024, 1, 1, 8, 30, tzinfo=CST).timestamp()
+        original_mtime = datetime(2024, 1, 1, 9, 0, tzinfo=CST).timestamp()
+        os.utime(path, (original_atime, original_mtime))
+        post = make_post("m1", created_at=datetime(2024, 1, 2, 12, 0, tzinfo=CST), media_items=[])
+
+        loader._apply_post_mtime(path, post)
+
+        stat = path.stat()
+        assert stat.st_atime == pytest.approx(original_atime, abs=1e-6)
+        assert stat.st_mtime == pytest.approx(loader._cst(post.created_at).timestamp(), abs=1e-6)
+
+    def test_download_media_mtime_failure_returns_failed_when_cleanup_succeeds(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        post = make_post("m1", created_at=datetime(2024, 1, 2, 12, 0, tzinfo=CST), media_items=[make_media("http://x.com/a.jpg")])
+        dest = tmp_path / "test.jpg"
+        dest.write_bytes(b"image data")
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            with patch.object(loader, "_apply_post_mtime", side_effect=OSError("utime failed")):
+                result = loader._download_media(post, "http://x.com/a.jpg", dest)
+
+        assert result == DownloadResult(MediaOutcome.FAILED, dest)
+
     def test_download_target_skipped_media_preserves_existing_mtime(self, tmp_path: Path):
         ctx = MockContext()
         loader = WeiboLoader(ctx, output_dir=tmp_path)
@@ -245,6 +274,22 @@ class TestDownloadMedia:
         media_events = [call.args[0] for call in sink.emit.call_args_list if call.args and call.args[0].kind == EventKind.MEDIA_DONE]
         assert len(media_events) == 1
         assert media_events[0].outcome == MediaOutcome.FAILED
+
+    def test_download_media_cleanup_failure_preserves_original_mtime_error(self, tmp_path: Path):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path)
+        post = make_post("m1", created_at=datetime(2024, 1, 2, 12, 0, tzinfo=CST), media_items=[])
+        path = tmp_path / "artifact.jpg"
+        path.write_bytes(b"image data")
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, path)):
+            with patch.object(loader, "_apply_post_mtime", side_effect=OSError("utime failed")):
+                with patch.object(loader, "_discard_failed_file", side_effect=OSError("cleanup failed")):
+                    with pytest.raises(OSError, match="utime failed") as excinfo:
+                        loader._download_media(post, "http://example.com/img.jpg", path)
+
+        assert excinfo.value.__context__ is not None
+        assert str(excinfo.value.__context__) == "cleanup failed"
 
     def test_discard_failed_file_raises_when_unlink_fails_without_truncating_symlink_target(self, tmp_path: Path):
         ctx = MockContext()
@@ -896,6 +941,51 @@ class TestMetadataExport:
 
         assert json_path.read_text(encoding="utf-8") == '{"mid":"old"}'
         assert json_path.stat().st_mtime == original_mtime
+
+    @pytest.mark.parametrize(
+        ("method_name", "loader_kwargs", "expected_name", "existing_content"),
+        [
+            ("_write_json", {"metadata_json": True}, "m123.json", '{"mid":"old"}'),
+            ("_write_txt", {"post_metadata_txt": "template content"}, "m123.txt", "old content"),
+        ],
+    )
+    def test_sidecar_rewrite_uses_atomic_replace(self, tmp_path: Path, method_name: str, loader_kwargs: dict, expected_name: str, existing_content: str):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, **loader_kwargs)
+        post = make_post("m123", created_at=datetime(2024, 1, 2, 12, 0, tzinfo=CST), media_items=[])
+        target_dir = tmp_path / "test"
+        target_dir.mkdir()
+        sidecar_path = target_dir / expected_name
+        sidecar_path.write_text(existing_content, encoding="utf-8")
+
+        with patch("os.replace", side_effect=OSError("replace failed")):
+            with pytest.raises(OSError, match="replace failed"):
+                getattr(loader, method_name)(target_dir, post, output_compatible=False)
+
+        assert sidecar_path.read_text(encoding="utf-8") == existing_content
+        assert [p.name for p in target_dir.iterdir()] == [expected_name]
+
+    @pytest.mark.parametrize(
+        ("method_name", "loader_kwargs"),
+        [
+            ("_write_json", {"metadata_json": True}),
+            ("_write_txt", {"post_metadata_txt": "template content"}),
+        ],
+    )
+    def test_sidecar_cleanup_failure_preserves_original_mtime_error(self, tmp_path: Path, method_name: str, loader_kwargs: dict):
+        ctx = MockContext()
+        loader = WeiboLoader(ctx, output_dir=tmp_path, **loader_kwargs)
+        post = make_post("m123", created_at=datetime(2024, 1, 2, 12, 0, tzinfo=CST), media_items=[])
+        target_dir = tmp_path / "test"
+        target_dir.mkdir()
+
+        with patch.object(loader, "_apply_post_mtime", side_effect=OSError("utime failed")):
+            with patch.object(loader, "_discard_failed_file", side_effect=OSError("cleanup failed")):
+                with pytest.raises(OSError, match="utime failed") as excinfo:
+                    getattr(loader, method_name)(target_dir, post, output_compatible=False)
+
+        assert excinfo.value.__context__ is not None
+        assert str(excinfo.value.__context__) == "cleanup failed"
 
     def test_post_metadata_txt_compatible_rerun_preserves_existing_sidecar_and_mtime(self, tmp_path: Path):
         ctx = MockContext()

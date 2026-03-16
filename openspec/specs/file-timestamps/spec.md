@@ -45,3 +45,9 @@ The system SHALL apply the normalized post timestamp to JSON and TXT sidecars, a
 #### Scenario: Sidecar timestamp application failure removes the sidecar and fails the target
 - **WHEN** sidecar content is written but applying `mtime` fails
 - **THEN** the system SHALL remove that sidecar file and SHALL fail the current target instead of continuing with a partially-correct artifact
+
+<!-- PBT: fresh_media_mtime == _cst(post.created_at).timestamp() within tolerance -->
+<!-- PBT: skipped_nonempty_media preserves prior mtime exactly -->
+<!-- PBT: compatible_rerun keeps sidecar bytes and mtime unchanged -->
+<!-- PBT: incompatible_output_options force sidecar rewrite with mtime realignment -->
+<!-- PBT: failed_mtime_application leaves no landed media or sidecar artifact behind -->
