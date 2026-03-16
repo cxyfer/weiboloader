@@ -1,36 +1,11 @@
 """Tests for CLI (Phase 5.1)."""
 from __future__ import annotations
 
-import sys
-import types
 from importlib import import_module
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import given, strategies as st
-
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "weiboloader"
-if "weiboloader" not in sys.modules:
-    package = types.ModuleType("weiboloader")
-    package.__path__ = [str(_PACKAGE_ROOT)]
-    sys.modules["weiboloader"] = package
-
-if "weiboloader.context" not in sys.modules:
-    context_module = types.ModuleType("weiboloader.context")
-
-    class WeiboLoaderContext: ...
-
-    context_module.WeiboLoaderContext = WeiboLoaderContext
-    sys.modules["weiboloader.context"] = context_module
-
-if "weiboloader.weiboloader" not in sys.modules:
-    loader_module = types.ModuleType("weiboloader.weiboloader")
-
-    class WeiboLoader: ...
-
-    loader_module.WeiboLoader = WeiboLoader
-    sys.modules["weiboloader.weiboloader"] = loader_module
 
 cli_main = import_module("weiboloader.__main__")
 _extract_mid_from_url = cli_main._extract_mid_from_url
@@ -376,3 +351,14 @@ class TestVisitorCookiesFlag:
     def test_flag_default_false(self):
         args = parse_args(["123456"])
         assert args.visitor_cookies is False
+
+
+class TestModuleIsolation:
+    def test_cli_tests_use_real_loader_modules(self):
+        context_module = import_module("weiboloader.context")
+        loader_module = import_module("weiboloader.weiboloader")
+
+        assert context_module.__file__.endswith("weiboloader/context.py")
+        assert loader_module.__file__.endswith("weiboloader/weiboloader.py")
+        assert "output_dir" in loader_module.WeiboLoader.__init__.__code__.co_varnames
+        assert "rate_controller" in context_module.WeiboLoaderContext.__init__.__code__.co_varnames
