@@ -21,7 +21,7 @@ def parse_weibo_datetime(raw: str, now: datetime | None = None) -> datetime:
     raw = raw.strip()
 
     try:
-        return datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y").astimezone(CST)
+        return datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
     except ValueError:
         pass
 

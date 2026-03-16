@@ -1,7 +1,21 @@
 from datetime import datetime, timedelta, timezone
+import sys
+import types
+
 import pytest
+
+try:
+    import certifi
+except Exception:
+    certifi = types.ModuleType("certifi")
+    sys.modules["certifi"] = certifi
+if not hasattr(certifi, "where"):
+    certifi.where = lambda: ""
+
 from weiboloader.adapter import parse_weibo_datetime, parse_user_info, parse_post, CST
 from weiboloader.exceptions import APISchemaError
+
+UTC_PLUS_9 = timezone(timedelta(hours=9))
 
 def test_parse_weibo_datetime_standard():
     raw = "Mon Aug 13 10:00:00 +0800 2018"
@@ -27,6 +41,26 @@ def test_parse_weibo_datetime_short():
 def test_parse_weibo_datetime_full():
     dt = parse_weibo_datetime("2023-12-31")
     assert dt == datetime(2023, 12, 31, 0, 0, 0, tzinfo=CST)
+
+def test_parse_weibo_datetime_preserves_original_timezone_for_absolute_input():
+    raw = "Mon Aug 13 10:00:00 +0900 2018"
+    dt = parse_weibo_datetime(raw)
+    assert dt.isoformat() == "2018-08-13T10:00:00+09:00"
+    assert dt.utcoffset() == timedelta(hours=9)
+
+
+def test_parse_post_keeps_original_timezone_on_created_at():
+    raw_card = {
+        "mblog": {
+            "mid": "5000000001",
+            "text": "Hello timezone",
+            "created_at": "Mon Aug 13 10:00:00 +0900 2018",
+        }
+    }
+    post = parse_post(raw_card)
+    assert post.created_at.isoformat() == "2018-08-13T10:00:00+09:00"
+    assert post.created_at.utcoffset() == timedelta(hours=9)
+
 
 def test_parse_user_info():
     raw = {"id": 12345, "screen_name": "test_user", "avatar_large": "http://avatar"}
