@@ -94,7 +94,7 @@
 
 ### D4. Pinned post 以原始 payload 的 `mblogtype == 2` 判定，且只影響 cutoff，不改變 boundary 本身
 
-User timeline 的 pinned 判定規則固定為：檢查 `post.raw.get("mblog", post.raw).get("mblogtype") == 2`。這與外部參考專案（特別是 `dataabc/weibo-crawler`）的一致性最高，且符合目前 `parse_post()` 會保留原始 `raw` payload 的現況。
+User timeline 的 pinned 判定規則固定為：先取 `payload = post.raw.get("mblog", post.raw)`，再以 `isinstance(payload, dict) and payload.get("mblogtype") == 2` 判定。這與外部參考專案（特別是 `dataabc/weibo-crawler`）的一致性最高，且符合目前 `parse_post()` 會保留原始 `raw` payload 的現況，同時避免文件示例在非 dict payload 上造成 `AttributeError`。
 
 Pinned 的行為規則固定為：
 - 不得作為 `date-boundary` 或 `id-boundary` 的 cutoff 依據。

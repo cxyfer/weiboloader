@@ -1061,6 +1061,20 @@ class TestBoundaryFiltering:
 
         assert not mock_download.called
 
+    def test_user_target_nondecimal_mid_does_not_trigger_cutoff(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        shared = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([make_post("-1", shared, [make_media("http://example.com/skip.jpg")])], "cursor-2")
+        ctx._posts["u:test:p:2"] = ([make_post("150", shared, [make_media("http://example.com/in.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="100:200")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(target) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
     def test_search_target_keeps_scanning_when_post_is_out_of_range(self, tmp_path: Path):
         ctx = MockContext()
         older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)

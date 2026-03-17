@@ -49,10 +49,7 @@ class IdBoundary:
         return f"{start}:{end}"
 
     def contains(self, mid: str) -> bool:
-        try:
-            value = _parse_id_endpoint(mid, field_name="post MID")
-        except InitError:
-            return False
+        value = parse_mid_value(mid)
         if value is None:
             return False
         if self.start is not None and value < self.start:
@@ -88,6 +85,13 @@ def serialize_boundary(boundary: DateBoundary | IdBoundary | None) -> str | None
     if boundary is None:
         return None
     return boundary.serialize()
+
+
+def parse_mid_value(mid: str) -> int | None:
+    try:
+        return _parse_id_endpoint(mid, field_name="post MID")
+    except InitError:
+        return None
 
 
 def _split_boundary(raw: str | None, *, flag_name: str) -> tuple[str, str] | None:

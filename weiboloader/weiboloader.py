@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .boundary import DateBoundary, IdBoundary, parse_date_boundary, parse_id_boundary, serialize_boundary
+from .boundary import DateBoundary, IdBoundary, parse_date_boundary, parse_id_boundary, parse_mid_value, serialize_boundary
 from .context import WeiboLoaderContext
 from .exceptions import CheckpointError, TargetError
 from .naming import build_directory, build_filename
@@ -560,8 +560,8 @@ class WeiboLoader:
         (target_dir / f"{post.mid}.txt").write_text(self.post_metadata_txt, encoding="utf-8")
 
     def _hash_options(self) -> str:
-        # Progress compatibility only depends on options that change filenames
-        # or create additional output files. Traversal-only flags such as count
+        # Progress compatibility depends on output-shaping options plus
+        # canonical boundary selection. Traversal-only flags such as count
         # and fast_update must keep existing resume and coverage reusable.
         payload = {
             "dirname": self.dirname_pattern,
@@ -662,9 +662,8 @@ class WeiboLoader:
         if self.date_boundary is not None and self.date_boundary.start is not None and boundary_dt.date() < self.date_boundary.start:
             return True
         if self.id_boundary is not None and self.id_boundary.start is not None:
-            try:
-                mid_value = int(post.mid)
-            except ValueError:
+            mid_value = parse_mid_value(post.mid)
+            if mid_value is None:
                 return False
             if mid_value < self.id_boundary.start:
                 return True
