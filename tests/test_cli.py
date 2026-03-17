@@ -1,36 +1,11 @@
 """Tests for CLI (Phase 5.1)."""
 from __future__ import annotations
 
-import sys
-import types
 from importlib import import_module
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import given, strategies as st
-
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "weiboloader"
-if "weiboloader" not in sys.modules:
-    package = types.ModuleType("weiboloader")
-    package.__path__ = [str(_PACKAGE_ROOT)]
-    sys.modules["weiboloader"] = package
-
-if "weiboloader.context" not in sys.modules:
-    context_module = types.ModuleType("weiboloader.context")
-
-    class WeiboLoaderContext: ...
-
-    context_module.WeiboLoaderContext = WeiboLoaderContext
-    sys.modules["weiboloader.context"] = context_module
-
-if "weiboloader.weiboloader" not in sys.modules:
-    loader_module = types.ModuleType("weiboloader.weiboloader")
-
-    class WeiboLoader: ...
-
-    loader_module.WeiboLoader = WeiboLoader
-    sys.modules["weiboloader.weiboloader"] = loader_module
 
 cli_main = import_module("weiboloader.__main__")
 _extract_mid_from_url = cli_main._extract_mid_from_url
@@ -43,6 +18,13 @@ MidTarget = structures_module.MidTarget
 SearchTarget = structures_module.SearchTarget
 SuperTopicTarget = structures_module.SuperTopicTarget
 UserTarget = structures_module.UserTarget
+
+
+def _parse_error_output(argv, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args(argv)
+    assert exc_info.value.code == 2
+    return capsys.readouterr().err
 
 
 class TestExtractMidFromUrl:
@@ -177,12 +159,64 @@ class TestParseArgs:
         assert args.workers == 7
         assert args.captcha_mode == "skip"
 
+    def test_boundary_options_parse_canonical_forms(self):
+        args = parse_args([
+            "--date-boundary", "20250301:2025-03-31",
+            "--id-boundary", "00123:0456",
+            "123",
+        ])
+        assert args.date_boundary == "2025-03-01:2025-03-31"
+        assert args.id_boundary == "123:456"
+
+    def test_boundary_colon_is_treated_as_unset(self):
+        args = parse_args([
+            "--date-boundary", ":",
+            "--id-boundary", ":",
+            "123",
+        ])
+        assert args.date_boundary is None
+        assert args.id_boundary is None
+
+    def test_boundary_rejects_descending_date_range(self, capsys):
+        err = _parse_error_output([
+            "--date-boundary", "2025-03-31:2025-03-01",
+            "123",
+        ], capsys)
+        assert "date-boundary" in err
+        assert "unrecognized arguments" not in err
+
+    def test_boundary_rejects_invalid_id_endpoint(self, capsys):
+        err = _parse_error_output([
+            "--id-boundary", "abc:123",
+            "123",
+        ], capsys)
+        assert "id-boundary" in err
+        assert "unrecognized arguments" not in err
+
+    def test_boundary_rejects_noncanonical_date_widths(self, capsys):
+        err = _parse_error_output([
+            "--date-boundary", "2025-3-1:2025-03-31",
+            "123",
+        ], capsys)
+        assert "date-boundary" in err
+        assert "YYYYMMDD" in err or "YYYY-MM-DD" in err
+
     def test_api_rate_defaults(self):
         args = parse_args(["123456"])
         assert args.request_interval == 1.0
         assert args.api_rate_limit == 60
         assert args.api_rate_window == 600
         assert args.workers == 1
+
+    def test_help_documents_boundary_syntax(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            parse_args(["--help"])
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "-b" in output and "--date-boundary" in output
+        assert "-B" in output and "--id-boundary" in output
+        assert "START:END" in output
+        assert "YYYYMMDD" in output and "YYYY-MM-DD" in output
 
     def test_latest_stamps_is_rejected(self):
         with pytest.raises(SystemExit):
@@ -253,6 +287,26 @@ class TestMainRuntimeDefaults:
         assert mock_loader_cls.call_args.kwargs["no_coverage"] is True
         assert "latest_stamps" not in mock_loader_cls.call_args.kwargs
 
+    def test_main_passes_canonical_boundaries(self):
+        fake_context = MagicMock()
+        fake_context.load_session.return_value = False
+
+        fake_loader = MagicMock()
+        fake_loader.download_targets.return_value = {"u:123456": True}
+
+        with patch.object(cli_main, "SlidingWindowRateController", return_value=object()):
+            with patch.object(cli_main, "WeiboLoaderContext", return_value=fake_context):
+                with patch.object(cli_main, "WeiboLoader", return_value=fake_loader) as mock_loader_cls:
+                    code = cli_main.main([
+                        "--date-boundary", "20250301:2025-03-31",
+                        "--id-boundary", "00123:0456",
+                        "123456",
+                    ])
+
+        assert code == 0
+        assert mock_loader_cls.call_args.kwargs["date_boundary"] == "2025-03-01:2025-03-31"
+        assert mock_loader_cls.call_args.kwargs["id_boundary"] == "123:456"
+
 
 class TestExitCodeProperty:
     @given(st.lists(st.text(min_size=1), min_size=1, max_size=5))
@@ -297,3 +351,14 @@ class TestVisitorCookiesFlag:
     def test_flag_default_false(self):
         args = parse_args(["123456"])
         assert args.visitor_cookies is False
+
+
+class TestModuleIsolation:
+    def test_cli_tests_use_real_loader_modules(self):
+        context_module = import_module("weiboloader.context")
+        loader_module = import_module("weiboloader.weiboloader")
+
+        assert context_module.__file__.endswith("weiboloader/context.py")
+        assert loader_module.__file__.endswith("weiboloader/weiboloader.py")
+        assert "output_dir" in loader_module.WeiboLoader.__init__.__code__.co_varnames
+        assert "rate_controller" in context_module.WeiboLoaderContext.__init__.__code__.co_varnames

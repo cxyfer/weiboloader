@@ -6,6 +6,7 @@ import re
 import sys
 from urllib.parse import parse_qs, urlparse
 
+from .boundary import parse_date_boundary, parse_id_boundary, serialize_boundary
 from .context import WeiboLoaderContext
 from .exceptions import InitError, map_exception_to_exit_code
 from .ratecontrol import SlidingWindowRateController
@@ -82,6 +83,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--filename-pattern", default="{date}_{name}")
 
     parser.add_argument("--post-filter")
+    parser.add_argument(
+        "-b", "--date-boundary",
+        help="Inclusive START:END date range (open-ended allowed). Supports YYYYMMDD and YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "-B", "--id-boundary",
+        help="Inclusive START:END MID range (open-ended allowed). Uses decimal integer endpoints.",
+    )
     parser.add_argument("--count", type=int, default=0)
     parser.add_argument("--fast-update", action="store_true")
 
@@ -96,6 +105,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Auto-fetch visitor cookies via Playwright (requires playwright)")
 
     args = parser.parse_args(argv)
+
+    try:
+        args.date_boundary = serialize_boundary(parse_date_boundary(args.date_boundary))
+        args.id_boundary = serialize_boundary(parse_id_boundary(args.id_boundary))
+    except InitError as exc:
+        parser.error(str(exc))
 
     if args.count < 0:
         parser.error("--count must be >= 0")
@@ -191,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
             max_workers=args.workers,
             no_resume=args.no_resume,
             no_coverage=args.no_coverage,
+            date_boundary=args.date_boundary,
+            id_boundary=args.id_boundary,
             progress=sink,
         )
 

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .boundary import DateBoundary, IdBoundary, parse_date_boundary, parse_id_boundary, parse_mid_value, serialize_boundary
 from .context import WeiboLoaderContext
 from .exceptions import CheckpointError, TargetError
 from .naming import build_directory, build_filename
@@ -92,6 +93,8 @@ class WeiboLoader:
         max_workers: int = 1,
         no_resume: bool = False,
         no_coverage: bool = False,
+        date_boundary: str | None = None,
+        id_boundary: str | None = None,
         checkpoint_dir: str | Path | None = None,
         output_dir: str | Path = ".",
         progress: ProgressSink | None = None,
@@ -109,6 +112,10 @@ class WeiboLoader:
         self.max_workers = max(1, max_workers)
         self.no_resume = no_resume
         self.no_coverage = no_coverage
+        self.date_boundary: DateBoundary | None = parse_date_boundary(date_boundary)
+        self.id_boundary: IdBoundary | None = parse_id_boundary(id_boundary)
+        self._date_boundary_key = serialize_boundary(self.date_boundary)
+        self._id_boundary_key = serialize_boundary(self.id_boundary)
         self.output_dir = Path(output_dir).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +175,7 @@ class WeiboLoader:
         )
         self._active_progress[resolved.key] = active
 
-        target_dir = self._build_dir(resolved)
+        target_dir: Path | None = None
 
         processed = 0
         ok = True
@@ -208,6 +215,12 @@ class WeiboLoader:
                     current_group_stamp = None
                     current_group_ok = True
 
+                boundary_action = self._boundary_action(resolved.target, post)
+                if boundary_action == "break":
+                    break
+                if boundary_action == "continue":
+                    continue
+
                 if not self.no_coverage and ProgressStore.contains(self._materialized_coverage(active), created):
                     continue
 
@@ -217,6 +230,8 @@ class WeiboLoader:
                     group_entry_resume = active.resume if gap_open else safe_resume
                     group_resume = group_entry_resume
 
+                if target_dir is None:
+                    target_dir = self._build_dir(resolved)
                 jobs = self._media_jobs(target_dir, post)
                 if self.fast_update and not has_checkpoint_state and any(p.exists() and p.stat().st_size > 0 for _, p in jobs):
                     target_complete = False
@@ -609,8 +624,8 @@ class WeiboLoader:
             raise
 
     def _hash_options(self) -> str:
-        # Progress compatibility only depends on options that change filenames
-        # or create additional output files. Traversal-only flags such as count
+        # Progress compatibility depends on output-shaping options plus
+        # canonical boundary selection. Traversal-only flags such as count
         # and fast_update must keep existing resume and coverage reusable.
         payload = {
             "dirname": self.dirname_pattern,
@@ -619,6 +634,8 @@ class WeiboLoader:
             "no_pictures": self.no_pictures,
             "metadata_json": self.metadata_json,
             "post_metadata_txt": self.post_metadata_txt,
+            "date_boundary": self._date_boundary_key,
+            "id_boundary": self._id_boundary_key,
         }
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -688,6 +705,43 @@ class WeiboLoader:
             return
         self._commit_coverage_run(active)
 
+    def _boundary_action(self, target: TargetSpec, post: Post) -> str:
+        if self._is_in_range(post):
+            return "process"
+        if isinstance(target, MidTarget):
+            return "continue"
+        if isinstance(target, UserTarget) and not self._is_pinned(post) and self._is_below_lower_bound(post):
+            return "break"
+        return "continue"
+
+    def _is_in_range(self, post: Post) -> bool:
+        if self.date_boundary is not None and not self.date_boundary.contains(self._boundary_datetime(post.created_at)):
+            return False
+        if self.id_boundary is not None and not self.id_boundary.contains(post.mid):
+            return False
+        return True
+
+    def _is_below_lower_bound(self, post: Post) -> bool:
+        boundary_dt = self._boundary_datetime(post.created_at)
+        if self.date_boundary is not None and self.date_boundary.start is not None and boundary_dt.date() < self.date_boundary.start:
+            return True
+        if self.id_boundary is not None and self.id_boundary.start is not None:
+            mid_value = parse_mid_value(post.mid)
+            if mid_value is None:
+                return False
+            if mid_value < self.id_boundary.start:
+                return True
+        return False
+
+    @staticmethod
+    def _is_pinned(post: Post) -> bool:
+        payload = post.raw.get("mblog", post.raw)
+        return isinstance(payload, dict) and payload.get("mblogtype") == 2
+
+    @staticmethod
+    def _boundary_datetime(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=CST)
+
     @staticmethod
     def _target_key(target: TargetSpec) -> str:
         if isinstance(target, UserTarget):
@@ -702,4 +756,4 @@ class WeiboLoader:
 
     @staticmethod
     def _cst(dt: datetime) -> datetime:
-        return dt if dt.tzinfo else dt.replace(tzinfo=CST)
+        return dt.astimezone(CST) if dt.tzinfo else dt.replace(tzinfo=CST)

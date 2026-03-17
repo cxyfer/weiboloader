@@ -31,7 +31,12 @@ from weiboloader.weiboloader import WeiboLoader
 CST = timezone(timedelta(hours=8))
 
 
-def make_post(mid: str, created_at: datetime | None = None, media_items: list[MediaItem] | None = None) -> Post:
+def make_post(
+    mid: str,
+    created_at: datetime | None = None,
+    media_items: list[MediaItem] | None = None,
+    raw: dict | None = None,
+) -> Post:
     return Post(
         mid=mid,
         bid=None,
@@ -39,7 +44,7 @@ def make_post(mid: str, created_at: datetime | None = None, media_items: list[Me
         created_at=created_at or datetime.now(CST),
         user=None,
         media_items=media_items or [],
-        raw={"mid": mid, "text": f"Post {mid}"},
+        raw=raw or {"mid": mid, "text": f"Post {mid}"},
     )
 
 
@@ -1215,6 +1220,20 @@ class TestOptionsHash:
 
         assert loader1._options_hash != loader2._options_hash
 
+    def test_hash_changes_with_date_boundary(self, tmp_path: Path):
+        ctx = MockContext()
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-01:2024-01-31")
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-02-01:2024-02-28")
+
+        assert loader1._options_hash != loader2._options_hash
+
+    def test_hash_reuses_canonical_equivalent_boundaries(self, tmp_path: Path):
+        ctx = MockContext()
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="20240101:2024-01-31", id_boundary="00123:0456")
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-01:2024-01-31", id_boundary="123:456")
+
+        assert loader1._options_hash == loader2._options_hash
+
     def test_hash_ignores_count(self, tmp_path: Path):
         ctx = MockContext()
         loader1 = WeiboLoader(ctx, output_dir=tmp_path, count=1)
@@ -1242,6 +1261,273 @@ class TestOptionsHash:
         loader2 = WeiboLoader(ctx, output_dir=tmp_path, post_metadata_txt="template content")
 
         assert loader1._options_hash != loader2._options_hash
+
+    def test_boundary_mismatch_does_not_reuse_coverage(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:2024-01-02")
+        ProgressStore(tmp_path / ".progress").save(target_key, coverage=[(ts, ts)], coverage_options_hash=loader1._options_hash)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-01:2024-01-03")
+        ctx._posts["u:test:p:1"] = ([make_post("m1", ts, [make_media("http://example.com/1.jpg")])], None)
+
+        with patch.object(loader2, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg")) as mock_download:
+            assert loader2.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert mock_download.call_count == 1
+
+    def test_canonical_equivalent_boundary_reuses_coverage(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        ts = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="20240102:2024-01-02", id_boundary="00123:00123")
+        ProgressStore(tmp_path / ".progress").save(target_key, coverage=[(ts, ts)], coverage_options_hash=loader1._options_hash)
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:2024-01-02", id_boundary="123:123")
+        ctx._posts["u:test:p:1"] = ([make_post("123", ts, [make_media("http://example.com/1.jpg")])], None)
+
+        with patch.object(loader2, "_download") as mock_download:
+            assert loader2.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert not mock_download.called
+
+    def test_boundary_skip_preserves_resume_frontier_for_later_rerun(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        out_of_range = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        in_range_1 = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        in_range_2 = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("out", out_of_range, [make_media("http://example.com/out.jpg")]),
+            make_post("in1", in_range_1, [make_media("http://example.com/in1.jpg")]),
+            make_post("in2", in_range_2, [make_media("http://example.com/in2.jpg")]),
+        ], None)
+
+        loader1 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary=":2024-01-02", count=1)
+        with patch.object(loader1, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg")):
+            assert loader1.download_target(target) is True
+
+        saved = load_progress_state(tmp_path, "u:test")
+        assert saved is not None
+        assert saved.resume is not None
+        assert [post.mid for post in saved.resume.buffered_posts] == ["in2"]
+
+        loader2 = WeiboLoader(ctx, output_dir=tmp_path, date_boundary=":2024-01-02", count=2)
+        downloads: list[str] = []
+        with patch.object(loader2, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader2.download_target(target) is True
+
+        assert downloads == ["2024-01-01_media_0.jpg"]
+
+    def test_out_of_range_same_timestamp_does_not_block_in_range_coverage(self, tmp_path: Path):
+        ctx = MockContext()
+        target_key = "u:test"
+        shared = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("1", shared, [make_media("http://example.com/in.jpg")]),
+            make_post("2", shared, [make_media("http://example.com/out.jpg")]),
+            make_post("0", older, [make_media("http://example.com/older.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="1:1")
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "x.jpg")):
+            assert loader.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        saved = load_progress_state(tmp_path, target_key)
+        assert saved is not None
+        assert ProgressStore.contains(saved.coverage, shared)
+        assert not ProgressStore.contains(saved.coverage, older)
+
+
+class TestBoundaryFiltering:
+    def test_user_target_stops_at_lower_bound(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        in_range = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([make_post("old", older, [make_media("http://example.com/old.jpg")])], "cursor-2")
+        ctx._posts["u:test:p:2"] = ([make_post("in", in_range, [make_media("http://example.com/in.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:")
+
+        with patch.object(loader, "_download") as mock_download:
+            assert loader.download_target(target) is True
+
+        assert not mock_download.called
+
+    def test_user_target_nondecimal_mid_does_not_trigger_cutoff(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        shared = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["u:test:p:1"] = ([make_post("-1", shared, [make_media("http://example.com/skip.jpg")])], "cursor-2")
+        ctx._posts["u:test:p:2"] = ([make_post("150", shared, [make_media("http://example.com/in.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="100:200")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(target) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_search_target_keeps_scanning_when_post_is_out_of_range(self, tmp_path: Path):
+        ctx = MockContext()
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        in_range = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["s:topic:p:1"] = ([make_post("old", older, [make_media("http://example.com/old.jpg")])], "cursor-2")
+        ctx._posts["s:topic:p:2"] = ([make_post("in", in_range, [make_media("http://example.com/in.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(SearchTarget(keyword="topic")) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_pinned_out_of_range_post_does_not_trigger_cutoff(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        in_range = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        pinned_raw = {"mblog": {"mblogtype": 2, "mid": "pin"}}
+        ctx._posts["u:test:p:1"] = ([
+            make_post("pin", older, [make_media("http://example.com/pin.jpg")], raw=pinned_raw),
+            make_post("in", in_range, [make_media("http://example.com/in.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(target) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_fast_update_ignores_out_of_range_existing_file(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        out_of_range = datetime(2024, 1, 3, 12, 0, tzinfo=CST)
+        in_range = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        post1 = make_post("out", out_of_range, [make_media("http://example.com/out.jpg")])
+        post2 = make_post("in", in_range, [make_media("http://example.com/in.jpg")])
+        ctx._posts["u:test:p:1"] = ([post1, post2], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:2024-01-02", fast_update=True)
+        target_dir = loader._build_dir(loader._resolve_target(target))
+        existing_path = loader._media_jobs(target_dir, post1)[0][1]
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text("existing")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(target) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_out_of_range_posts_do_not_consume_count(self, tmp_path: Path):
+        ctx = MockContext()
+        target = UserTarget(identifier="test", is_uid=True)
+        ctx._posts["u:test:p:1"] = ([
+            make_post("out", datetime(2024, 1, 3, 12, 0, tzinfo=CST), [make_media("http://example.com/out.jpg")]),
+            make_post("in1", datetime(2024, 1, 2, 12, 0, tzinfo=CST), [make_media("http://example.com/in1.jpg")]),
+            make_post("in2", datetime(2024, 1, 1, 12, 0, tzinfo=CST), [make_media("http://example.com/in2.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary=":2024-01-02", count=1)
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(target) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_mid_target_out_of_range_succeeds_without_side_effects(self, tmp_path: Path):
+        ctx = MockContext()
+        target = MidTarget(mid="mid-1")
+        ctx._posts["m:mid-1"] = [make_post("mid-1", datetime(2024, 1, 1, 12, 0, tzinfo=CST), [make_media("http://example.com/1.jpg")])]
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:", metadata_json=True, post_metadata_txt="meta")
+
+        with patch.object(loader, "_download") as mock_download:
+            assert loader.download_target(target) is True
+
+        assert not mock_download.called
+        assert list((tmp_path / "Mid_mid-1").glob("*.json")) == [] if (tmp_path / "Mid_mid-1").exists() else True
+
+    def test_mid_target_with_nondecimal_mid_and_id_boundary_succeeds_without_side_effects(self, tmp_path: Path):
+        ctx = MockContext()
+        target = MidTarget(mid="abc123")
+        ctx._posts["m:abc123"] = [make_post("abc123", datetime(2024, 1, 2, 12, 0, tzinfo=CST), [make_media("http://example.com/1.jpg")])]
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="100:200", metadata_json=True, post_metadata_txt="meta")
+
+        with patch.object(loader, "_download") as mock_download:
+            assert loader.download_target(target) is True
+
+        assert not mock_download.called
+        assert not (tmp_path / "Mid_abc123").exists()
+
+    def test_search_target_nondecimal_mid_is_treated_as_out_of_range(self, tmp_path: Path):
+        ctx = MockContext()
+        shared = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["s:topic:p:1"] = ([
+            make_post("abc123", shared, [make_media("http://example.com/a.jpg")]),
+            make_post("150", shared, [make_media("http://example.com/b.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="100:200")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(SearchTarget(keyword="topic")) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_supertopic_target_keeps_scanning_when_post_is_out_of_range(self, tmp_path: Path):
+        ctx = MockContext()
+        older = datetime(2024, 1, 1, 12, 0, tzinfo=CST)
+        in_range = datetime(2024, 1, 2, 12, 0, tzinfo=CST)
+        ctx._posts["t:topic:p:1"] = ([make_post("old", older, [make_media("http://example.com/old.jpg")])], "cursor-2")
+        ctx._posts["t:topic:p:2"] = ([make_post("in", in_range, [make_media("http://example.com/in.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(SuperTopicTarget(identifier="topic", is_containerid=True)) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_single_point_mid_boundary_matches_exact_post(self, tmp_path: Path):
+        ctx = MockContext()
+        ctx._posts["u:test:p:1"] = ([
+            make_post("124", datetime(2024, 1, 3, 12, 0, tzinfo=CST), [make_media("http://example.com/124.jpg")]),
+            make_post("123", datetime(2024, 1, 2, 12, 0, tzinfo=CST), [make_media("http://example.com/123.jpg")]),
+            make_post("122", datetime(2024, 1, 1, 12, 0, tzinfo=CST), [make_media("http://example.com/122.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, id_boundary="123:123")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert downloads == ["2024-01-02_media_0.jpg"]
+
+    def test_naive_timestamp_boundary_uses_cst_date(self, tmp_path: Path):
+        ctx = MockContext()
+        naive = datetime(2024, 1, 2, 0, 30, 0)
+        ctx._posts["u:test:p:1"] = ([make_post("m1", naive, [make_media("http://example.com/1.jpg")])], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-02:2024-01-02")
+
+        with patch.object(loader, "_download", return_value=DownloadResult(MediaOutcome.DOWNLOADED, tmp_path / "1.jpg")) as mock_download:
+            assert loader.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert mock_download.call_count == 1
+
+    def test_boundary_endpoints_are_inclusive(self, tmp_path: Path):
+        ctx = MockContext()
+        ctx._posts["u:test:p:1"] = ([
+            make_post("100", datetime(2024, 1, 3, 12, 0, tzinfo=CST), [make_media("http://example.com/100.jpg")]),
+            make_post("200", datetime(2024, 1, 1, 12, 0, tzinfo=CST), [make_media("http://example.com/200.jpg")]),
+        ], None)
+        loader = WeiboLoader(ctx, output_dir=tmp_path, date_boundary="2024-01-01:2024-01-03", id_boundary="100:200")
+        downloads: list[str] = []
+
+        with patch.object(loader, "_download", side_effect=lambda url, dest: downloads.append(dest.name) or DownloadResult(MediaOutcome.DOWNLOADED, dest)):
+            assert loader.download_target(UserTarget(identifier="test", is_uid=True)) is True
+
+        assert downloads == ["2024-01-03_media_0.jpg", "2024-01-01_media_0.jpg"]
 
 
 @given(st.integers(min_value=0, max_value=100))
