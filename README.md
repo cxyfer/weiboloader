@@ -2,25 +2,36 @@
 
 # weiboloader
 
-*A command-line tool for downloading media from [Weibo](https://weibo.com), inspired by [instaloader](https://github.com/instaloader/instaloader).*
-*Built as a rewrite of [weiboPicDownloader](https://github.com/cxyfer/weiboPicDownloader) (a fork of [nondanee/weiboPicDownloader](https://github.com/nondanee/weiboPicDownloader)).*
+*A Python CLI for downloading media from [Weibo](https://weibo.com), inspired by [instaloader](https://github.com/instaloader/instaloader).*
+*Built for reliable repeat runs with resumable progress, flexible filters, and customizable output layouts.*
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square&logo=python)](https://www.python.org)
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square)](LICENSE)
 
 </div>
 
-## Features
+## Highlights
 
-- Download from multiple target types: user timeline, supertopic, search keyword, single post (MID/URL)
-- Customizable file/directory naming with template patterns
-- Incremental download with automatic coverage tracking in `output_dir/.progress`
-- Resumable downloads with unified progress state (`resume` + `coverage`)
-- API sliding-window rate control (default: 60 requests / 600s) with exponential backoff
-- Captcha handling: auto (Playwright), browser-based, manual, or skip
-- Cookie authentication: browser import, string, file, session persistence
-- Visitor cookie auto-fetch via headless Playwright
-- Concurrent media downloads with configurable worker count
+- Download from user timelines, supertopics, search keywords, or individual posts (MID / URL)
+- Resume interrupted runs and skip already covered ranges on repeat downloads
+- Filter downloads by date range or MID range
+- Customize output directories and filenames with template patterns
+- Import cookies from browsers, strings, files, or reusable sessions
+- Use Playwright-assisted visitor-cookie and captcha flows when needed
+- Save metadata as JSON or plain-text sidecar files
+- Control request pacing and concurrent media downloads
+- Align newly written file timestamps with post timestamps
+
+## Stability notes
+
+> [!WARNING]
+> Resume and incremental state handling are still stabilizing in the `0.1.x` series. After interruptions, partial downloads, or option changes, recovery behavior may still evolve. If a resumed run looks wrong, retry with `--no-resume` or remove the matching entry under `output_dir/.progress/`.
+
+> [!WARNING]
+> Newly downloaded media and metadata files can use the source post timestamp as their modified time. This behavior is still considered early and may vary across platforms or filesystems. If applying the timestamp fails, the current artifact may be treated as failed and removed.
+
+> [!NOTE]
+> `--post-filter` is included for future compatibility and is not active in `v0.1.0`.
 
 ## Installation
 
@@ -28,16 +39,20 @@
 pip install .
 ```
 
-Optional dependencies:
+### Optional extras
 
 ```bash
 # Load cookies from local browser (Chrome/Firefox/Edge)
 pip install ".[browser]"
 
-# Auto-fetch visitor cookies & captcha auto-solve (requires: playwright install chromium)
+# Visitor cookies and automatic captcha flow
+# Also requires: playwright install chromium
 pip install ".[captcha]"
+```
 
-# Development
+### For development
+
+```bash
 pip install ".[dev]"
 ```
 
@@ -63,6 +78,12 @@ weiboloader -mid 5120000000000000
 weiboloader "https://m.weibo.cn/detail/5120000000000000"
 ```
 
+### Where files are saved
+
+- CLI downloads are written to the current working directory by default.
+- Download state is stored in `./.progress/` under that output root.
+- Use `--dirname-pattern` and `--filename-pattern` to customize directory and file layout.
+
 ### Authentication
 
 ```bash
@@ -75,7 +96,7 @@ weiboloader --cookie "SUB=xxx; SUBP=yyy" 1234567890
 # Cookie file
 weiboloader --cookie-file cookies.txt 1234567890
 
-# Session persistence (auto-saved after first auth)
+# Reuse a saved session after the first successful login
 weiboloader --sessionfile session.dat --cookie "SUB=xxx" 1234567890
 
 # Auto-fetch visitor cookies (requires playwright)
@@ -86,7 +107,39 @@ weiboloader --visitor-cookies 1234567890
 - `--visitor-cookies` requires `pip install ".[captcha]"` and `playwright install chromium`.
 - `--sessionfile FILE` lets you persist and reuse an authenticated session.
 
-### Options
+### Filter by date or post ID
+
+```bash
+# Inclusive date range
+weiboloader -b 20240101:20240131 1234567890
+
+# Open-ended date range
+weiboloader -b :2024-01-31 1234567890
+
+# Inclusive MID range
+weiboloader -B 5110000000000000:5120000000000000 1234567890
+```
+
+- `-b, --date-boundary` accepts inclusive `START:END` ranges with `YYYYMMDD` or `YYYY-MM-DD` endpoints.
+- `-B, --id-boundary` accepts inclusive decimal MID ranges.
+- Both boundary options support open-ended ranges such as `START:` or `:END`.
+
+### Save metadata files
+
+```bash
+# Save raw metadata JSON next to each post
+weiboloader --metadata-json 1234567890
+
+# Also write a plain-text note into <mid>.txt for each post
+weiboloader --metadata-json --post-metadata-txt "downloaded by weiboloader" 1234567890
+```
+
+- `--metadata-json` writes `<mid>.json` beside the downloaded media.
+- `--post-metadata-txt TXT` writes the text you provide into `<mid>.txt`; no template expansion is performed.
+
+### Common options
+
+This is a summary of the most useful CLI options. For the exact current CLI reference, run `weiboloader --help`.
 
 ```
 -mid, --mid MID          Download a single post by MID
@@ -98,42 +151,47 @@ weiboloader --visitor-cookies 1234567890
 --no-videos              Skip video downloads
 --no-pictures            Skip picture downloads
 --metadata-json          Save post metadata as JSON
---post-metadata-txt TXT  Save custom text per post
+--post-metadata-txt TXT  Write the provided text to <mid>.txt per post
 --dirname-pattern PAT    Directory naming pattern
 --filename-pattern PAT   File naming pattern (default: {date}_{name})
---count N                Limit number of posts (0 = unlimited)
---fast-update            Stop at first existing file
---no-resume              Disable cursor resume from unified progress
---no-coverage            Disable coverage-based incremental filtering
---request-interval SEC   Minimum seconds between requests per bucket (default: 1)
---api-rate-limit N       API sliding-window quota (default: 60)
---api-rate-window SEC    API sliding-window window in seconds (default: 600)
---workers N              Concurrent media download workers (default: 1)
+--post-filter EXPR       Reserved for future releases; not active in v0.1.0
+-b, --date-boundary      Inclusive START:END date range
+-B, --id-boundary        Inclusive START:END MID range
+--count N                Limit the number of posts (0 = unlimited)
+--fast-update            Stop early when existing output indicates older content
+--no-resume              Disable resume support for interrupted runs
+--no-coverage            Disable incremental skipping based on saved coverage
+--request-interval SEC   Minimum delay between requests (default: 1)
+--api-rate-limit N       API request quota per window (default: 60)
+--api-rate-window SEC    Length of the API quota window in seconds (default: 600)
+--workers N              Concurrent media downloads (default: 1)
 --captcha-mode MODE      auto|browser|manual|skip (default: auto)
 ```
 
 ### Progress persistence
 
-- The loader stores per-target progress in `output_dir/.progress/` by default.
-- Unified progress contains two parts: `resume` for cursor recovery after interruption, and `coverage` for incremental filtering across completed timestamp intervals.
-- Coverage tracks **successful run intervals** (continuous sequences of successfully downloaded timestamp groups) rather than individual timestamps, enabling efficient skip of large covered ranges.
-- Both `resume` and `coverage` are **options-aware**: they only apply when download options (filters, patterns, etc.) match the stored hash. Legacy progress files without option hashes are safely ignored until rewritten.
-- A successful target completion clears `resume` and keeps `coverage`.
-- Interrupted or failed runs keep `resume` and flush all **sealed successful runs** to `coverage` (the current incomplete group is never flushed).
-- All stop points (target complete, download failure, Ctrl+C, `--count` limit, `--fast-update` early stop) flush sealed runs to ensure consistent progress state.
-- `--no-resume` disables cursor recovery but still allows coverage-based skipping.
-- `--no-coverage` disables coverage-based skipping but still allows resume state to be written.
-- Ctrl+C flushes the same unified progress state before exit.
+- `weiboloader` stores download state in `output_dir/.progress/` to support resumed runs and incremental skipping.
+- Saved state is only reused when the relevant output and filter options still match.
+- A fully successful target clears `resume` but keeps `coverage` for later incremental runs.
+- Interrupted or failed runs keep the last safe `resume` point and commit completed coverage ranges.
+- Use `--no-resume` to ignore saved resume state, or `--no-coverage` to disable coverage-based skipping.
+- Ctrl+C flushes the current progress state before exit.
 
-### Request pacing
+### Post timestamps on downloaded files
 
-- API requests use a sliding-window quota of 60 requests per 600 seconds by default.
-- Override the API quota with `--api-rate-limit` and `--api-rate-window`.
-- `--request-interval` defaults to 1 second and applies separately to the `api` and `media` buckets.
-- Media requests are isolated from API quota usage and do not use the sliding-window quota.
-- Media downloads use 1 worker by default; override with `--workers`.
+- Newly downloaded media files use the source post timestamp as their modified time (`mtime`).
+- Metadata files created by `--metadata-json` and `--post-metadata-txt` follow the same rule.
+- Existing non-empty files that are skipped keep their current timestamp.
+- Empty files that are downloaded again receive a fresh post-aligned timestamp.
 
-### Naming Patterns
+### Request limits and concurrency
+
+- By default, API requests are paced with a quota of 60 requests per 600 seconds.
+- Adjust pacing with `--api-rate-limit`, `--api-rate-window`, and `--request-interval`.
+- Media downloads are paced separately from API quota tracking and use 1 worker by default.
+- Increase `--workers` if you want more concurrent media downloads.
+
+### Filename and directory templates
 
 Available template variables:
 
@@ -143,20 +201,21 @@ Available template variables:
 | `{uid}` | User ID |
 | `{mid}` | Post MID |
 | `{bid}` | Post BID |
-| `{date}` | Timestamp (default: `%Y%m%d_%H%M%S`) |
+| `{date}` | Timestamp (default: `%Y-%m-%d`) |
 | `{date:%Y-%m-%d}` | Custom date format |
 | `{text}` | Post text (truncated to 50 chars) |
 | `{index}` | Media index |
 | `{index:3}` | Zero-padded index |
 | `{type}` | Media type (picture/video) |
-| `{name}` | Original filename hint |
+| `{name}` | Original filename when available |
 | `{topic_name}` | Supertopic name |
 | `{keyword}` | Search keyword |
 
-## Programmatic Usage
+## Python API (advanced)
 
 ```python
-from weiboloader import WeiboLoader, WeiboLoaderContext, UserTarget
+from weiboloader import WeiboLoader, UserTarget
+from weiboloader.context import WeiboLoaderContext
 from weiboloader.ratecontrol import SlidingWindowRateController
 
 ctx = WeiboLoaderContext(
