@@ -124,6 +124,28 @@ weiboloader -B 5110000000000000:5120000000000000 1234567890
 - `-B, --id-boundary` accepts inclusive decimal MID ranges.
 - Both boundary options support open-ended ranges such as `START:` or `:END`.
 
+#### Boundary traversal behavior
+
+- `UserTarget` may stop pagination early once a **non-pinned** post falls below the active lower bound (`-b` start date or `-B` start MID).
+- Pinned posts are ignored for this cutoff check, so an out-of-range pinned post does **not** prevent later in-range posts from being scanned.
+- `SearchTarget` and `SuperTopicTarget` always keep scanning even when an individual post is out of range.
+- `MidTarget` never uses lower-bound cutoff logic; it simply skips the single post if it is out of range.
+- `-b, --date-boundary` compares by **calendar date** (not time-of-day). Naive timestamps are interpreted as CST (`UTC+08:00`).
+
+```mermaid
+flowchart TD
+    A[Read next post] --> B{Post matches all active boundaries?}
+    B -- Yes --> C[Process post]
+    B -- No --> D{Target type}
+    D -- MidTarget --> E[Skip post and continue]
+    D -- SearchTarget / SuperTopicTarget --> E
+    D -- UserTarget --> F{Pinned post?}
+    F -- Yes --> E
+    F -- No --> G{Below active lower bound?}
+    G -- Yes --> H[Stop paginating this user timeline]
+    G -- No --> E
+```
+
 ### Save metadata files
 
 ```bash
